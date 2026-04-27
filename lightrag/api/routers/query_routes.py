@@ -2,8 +2,9 @@
 This module contains all query-related routes for the LightRAG API.
 """
 
+import functools
 import json
-import os
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from lightrag.base import QueryParam
@@ -14,20 +15,20 @@ from pydantic import BaseModel, Field, field_validator
 router = APIRouter(tags=["query"])
 
 
+@functools.lru_cache(maxsize=512)
 def _extract_article_meta(file_path: str) -> tuple[str, str]:
-    """Return (title, source_url) by scanning the first ~20 lines of a markdown file."""
+    """Return (title, source_url) from the header block of an enriched markdown file."""
     title, url = "", ""
     try:
         with open(file_path, encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i > 20:
-                    break
-                if not title and line.startswith("# "):
-                    title = line[2:].strip()
-                if "**Source URL:**" in line:
-                    url = line.split("**Source URL:**", 1)[1].strip()
-                if title and url:
-                    break
+            header = f.read(1024)
+        for line in header.splitlines():
+            if not title and line.startswith("# "):
+                title = line[2:].strip()
+            if "**Source URL:**" in line:
+                url = line.split("**Source URL:**", 1)[1].strip()
+            if title and url:
+                break
     except OSError:
         pass
     return title, url
@@ -37,18 +38,19 @@ def _build_sources_section(references: list[dict], input_dir: str = "") -> str:
     """Build a markdown Sources section from reference dicts that contain file_path."""
     seen: set[str] = set()
     items: list[str] = []
+    base = Path(input_dir) if input_dir else None
     for ref in references:
         fp = ref.get("file_path", "")
         if not fp:
             continue
-        # file_path may be stored as a bare filename; resolve against input_dir if needed
-        if not os.path.isabs(fp) and input_dir and not os.path.exists(fp):
-            fp = os.path.join(input_dir, fp)
-        title, url = _extract_article_meta(fp)
+        p = Path(fp)
+        if base and not p.is_absolute():
+            p = base / p
+        title, url = _extract_article_meta(str(p))
         if not url or url in seen:
             continue
         seen.add(url)
-        label = title or os.path.basename(fp)
+        label = title or p.name
         items.append(f"- [{label}]({url})")
     if not items:
         return ""
@@ -234,6 +236,12 @@ class StreamChunkResponse(BaseModel):
 
 def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, default_user_prompt: str = "", input_dir: str = ""):
     combined_auth = get_combined_auth_dependency(api_key)
+
+    def _make_param(request: "QueryRequest", is_stream: bool) -> QueryParam:
+        param = request.to_query_params(is_stream)
+        if not param.user_prompt and default_user_prompt:
+            param.user_prompt = default_user_prompt
+        return param
 
     @router.post(
         "/query",
@@ -444,13 +452,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
         try:
-            param = request.to_query_params(
-                False
-            )  # Ensure stream=False for non-streaming endpoint
-            # Force stream=False for /query endpoint regardless of include_references setting
-            param.stream = False
-            if not param.user_prompt and default_user_prompt:
-                param.user_prompt = default_user_prompt
+            param = _make_param(request, False)
 
             # Unified approach: always use aquery_llm for both cases
             result = await rag.aquery_llm(request.query, param=param)
@@ -465,7 +467,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
             if not response_content:
                 response_content = "No relevant context found for the query."
 
-            # Append source URLs extracted from reference files
             response_content += _build_sources_section(references, input_dir)
 
             # Enrich references with chunk content if requested
@@ -709,9 +710,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
         try:
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
-            param = request.to_query_params(stream_mode)
-            if not param.user_prompt and default_user_prompt:
-                param.user_prompt = default_user_prompt
+            param = _make_param(request, stream_mode)
 
             from fastapi.responses import StreamingResponse
 
@@ -764,7 +763,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
                             logger.error(f"Streaming error: {str(e)}")
                             yield f"{json.dumps({'error': str(e)})}\n"
 
-                    # Append source URLs as a final streaming chunk
                     if sources_section:
                         yield f"{json.dumps({'response': sources_section})}\n"
                 else:
@@ -1196,9 +1194,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
             as structured data analysis typically requires source attribution.
         """
         try:
-            param = request.to_query_params(False)  # No streaming for data endpoint
-            if not param.user_prompt and default_user_prompt:
-                param.user_prompt = default_user_prompt
+            param = _make_param(request, False)
             response = await rag.aquery_data(request.query, param=param)
 
             # aquery_data returns the new format with status, message, data, and metadata
