@@ -3,6 +3,7 @@ This module contains all query-related routes for the LightRAG API.
 """
 
 import json
+import os
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from lightrag.base import QueryParam
@@ -11,6 +12,44 @@ from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(tags=["query"])
+
+
+def _extract_article_meta(file_path: str) -> tuple[str, str]:
+    """Return (title, source_url) by scanning the first ~20 lines of a markdown file."""
+    title, url = "", ""
+    try:
+        with open(file_path, encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i > 20:
+                    break
+                if not title and line.startswith("# "):
+                    title = line[2:].strip()
+                if "**Source URL:**" in line:
+                    url = line.split("**Source URL:**", 1)[1].strip()
+                if title and url:
+                    break
+    except OSError:
+        pass
+    return title, url
+
+
+def _build_sources_section(references: list[dict]) -> str:
+    """Build a markdown Sources section from reference dicts that contain file_path."""
+    seen: set[str] = set()
+    items: list[str] = []
+    for ref in references:
+        fp = ref.get("file_path", "")
+        if not fp:
+            continue
+        title, url = _extract_article_meta(fp)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        label = title or os.path.basename(fp)
+        items.append(f"- [{label}]({url})")
+    if not items:
+        return ""
+    return "\n\n**Sources:**\n" + "\n".join(items)
 
 
 class QueryRequest(BaseModel):
@@ -423,6 +462,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
             if not response_content:
                 response_content = "No relevant context found for the query."
 
+            # Append source URLs extracted from reference files
+            response_content += _build_sources_section(references)
+
             # Enrich references with chunk content if requested
             if request.include_references and request.include_chunk_content:
                 chunks = data.get("chunks", [])
@@ -702,6 +744,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
                         enriched_references.append(ref_copy)
                     references = enriched_references
 
+                sources_section = _build_sources_section(references)
+
                 if llm_response.get("is_streaming"):
                     # Streaming mode: send references first, then stream response chunks
                     if request.include_references:
@@ -716,11 +760,17 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
                         except Exception as e:
                             logger.error(f"Streaming error: {str(e)}")
                             yield f"{json.dumps({'error': str(e)})}\n"
+
+                    # Append source URLs as a final streaming chunk
+                    if sources_section:
+                        yield f"{json.dumps({'response': sources_section})}\n"
                 else:
                     # Non-streaming mode: send complete response in one message
                     response_content = llm_response.get("content", "")
                     if not response_content:
                         response_content = "No relevant context found for the query."
+
+                    response_content += sources_section
 
                     # Create complete response object
                     complete_response = {"response": response_content}
