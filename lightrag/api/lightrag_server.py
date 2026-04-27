@@ -1138,7 +1138,7 @@ def create_app(args):
             api_key,
         )
     )
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
+    app.include_router(create_query_routes(rag, api_key, args.top_k, args.query_user_prompt))
     app.include_router(create_graph_routes(rag, api_key))
 
     # Add Ollama API routes

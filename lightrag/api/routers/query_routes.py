@@ -190,7 +190,7 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, default_user_prompt: str = ""):
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.post(
@@ -407,6 +407,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             )  # Ensure stream=False for non-streaming endpoint
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
+            if not param.user_prompt and default_user_prompt:
+                param.user_prompt = default_user_prompt
 
             # Unified approach: always use aquery_llm for both cases
             result = await rag.aquery_llm(request.query, param=param)
@@ -663,6 +665,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
+            if not param.user_prompt and default_user_prompt:
+                param.user_prompt = default_user_prompt
 
             from fastapi.responses import StreamingResponse
 
@@ -1140,6 +1144,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         """
         try:
             param = request.to_query_params(False)  # No streaming for data endpoint
+            if not param.user_prompt and default_user_prompt:
+                param.user_prompt = default_user_prompt
             response = await rag.aquery_data(request.query, param=param)
 
             # aquery_data returns the new format with status, message, data, and metadata
