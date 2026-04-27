@@ -33,7 +33,7 @@ def _extract_article_meta(file_path: str) -> tuple[str, str]:
     return title, url
 
 
-def _build_sources_section(references: list[dict]) -> str:
+def _build_sources_section(references: list[dict], input_dir: str = "") -> str:
     """Build a markdown Sources section from reference dicts that contain file_path."""
     seen: set[str] = set()
     items: list[str] = []
@@ -41,6 +41,9 @@ def _build_sources_section(references: list[dict]) -> str:
         fp = ref.get("file_path", "")
         if not fp:
             continue
+        # file_path may be stored as a bare filename; resolve against input_dir if needed
+        if not os.path.isabs(fp) and input_dir and not os.path.exists(fp):
+            fp = os.path.join(input_dir, fp)
         title, url = _extract_article_meta(fp)
         if not url or url in seen:
             continue
@@ -229,7 +232,7 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, default_user_prompt: str = ""):
+def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, default_user_prompt: str = "", input_dir: str = ""):
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.post(
@@ -463,7 +466,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
                 response_content = "No relevant context found for the query."
 
             # Append source URLs extracted from reference files
-            response_content += _build_sources_section(references)
+            response_content += _build_sources_section(references, input_dir)
 
             # Enrich references with chunk content if requested
             if request.include_references and request.include_chunk_content:
@@ -744,7 +747,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
                         enriched_references.append(ref_copy)
                     references = enriched_references
 
-                sources_section = _build_sources_section(references)
+                sources_section = _build_sources_section(references, input_dir)
 
                 if llm_response.get("is_streaming"):
                     # Streaming mode: send references first, then stream response chunks
