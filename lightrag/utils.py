@@ -31,6 +31,7 @@ from lightrag.constants import (
 )
 from lightrag.config import PipelineConfig
 from lightrag.exceptions import PipelineCancelledException
+from lightrag.tokenization import truncate_list_by_token_size
 
 class SafeStreamHandler(logging.StreamHandler):
     """StreamHandler that gracefully handles closed streams during shutdown.
