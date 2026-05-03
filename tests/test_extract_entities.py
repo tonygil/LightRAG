@@ -65,7 +65,7 @@ async def test_gleaning_skipped_when_tokens_exceed_limit():
     config = _make_config(max_extract_input_tokens=10, entity_extract_max_gleaning=1)
     config.llm_model_func.return_value = _EXTRACTION_RESULT
 
-    with patch("lightrag.operate.logger") as mock_logger:
+    with patch("lightrag.extraction.logger") as mock_logger:
         await extract_entities(chunks=_make_chunks(), config=config)
 
     # LLM should be called exactly once (initial extraction only, no gleaning)
@@ -86,7 +86,7 @@ async def test_gleaning_proceeds_when_tokens_within_limit():
     config = _make_config(max_extract_input_tokens=999999, entity_extract_max_gleaning=1)
     config.llm_model_func.return_value = _EXTRACTION_RESULT
 
-    with patch("lightrag.operate.logger"):
+    with patch("lightrag.extraction.logger"):
         await extract_entities(chunks=_make_chunks(), config=config)
 
     # LLM should be called twice (initial extraction + gleaning)
@@ -102,7 +102,7 @@ async def test_no_gleaning_when_max_gleaning_zero():
     config = _make_config(max_extract_input_tokens=999999, entity_extract_max_gleaning=0)
     config.llm_model_func.return_value = _EXTRACTION_RESULT
 
-    with patch("lightrag.operate.logger"):
+    with patch("lightrag.extraction.logger"):
         await extract_entities(chunks=_make_chunks(), config=config)
 
     # LLM should be called exactly once (initial extraction only)
