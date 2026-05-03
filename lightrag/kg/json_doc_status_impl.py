@@ -9,10 +9,12 @@ from lightrag.base import (
 )
 from lightrag.utils import (
     _cooperative_yield,
-    load_json,
     logger,
-    write_json,
     get_pinyin_sort_key,
+)
+from lightrag.text_utils import (
+    load_json,
+    write_json,
 )
 from lightrag.exceptions import StorageNotInitializedError
 from .shared_storage import (

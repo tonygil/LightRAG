@@ -9,7 +9,7 @@ from enum import Enum
 from fastapi.responses import StreamingResponse
 import asyncio
 from lightrag import LightRAG, QueryParam
-from lightrag.utils import TiktokenTokenizer
+from lightrag.tokenization import TiktokenTokenizer
 from lightrag.api.utils_api import get_combined_auth_dependency
 from fastapi import Depends
 

@@ -25,8 +25,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lightrag import LightRAG
 from lightrag.base import DeletionResult, DocProcessingStatus, DocStatus
-from lightrag.utils import (
-    generate_track_id,
+from lightrag.utils import generate_track_id
+from lightrag.text_utils import (
     compute_mdhash_id,
     sanitize_text_for_encoding,
 )

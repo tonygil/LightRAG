@@ -446,7 +446,7 @@ class RedisKVStorage(BaseKVStorage):
 
         Early exit if any flattened key is found (indicating migration already done).
         """
-        from lightrag.utils import generate_cache_key
+        from lightrag.llm_cache import generate_cache_key
 
         async with self._get_redis_connection() as redis:
             # Get all keys for this namespace

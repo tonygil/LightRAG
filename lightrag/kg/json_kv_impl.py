@@ -7,8 +7,10 @@ from lightrag.base import (
 )
 from lightrag.utils import (
     _cooperative_yield,
-    load_json,
     logger,
+)
+from lightrag.text_utils import (
+    load_json,
     write_json,
 )
 from lightrag.exceptions import StorageNotInitializedError
@@ -250,7 +252,7 @@ class JsonKVStorage(BaseKVStorage):
         Returns:
             Migrated data dictionary with flattened cache keys (sanitized if needed)
         """
-        from lightrag.utils import generate_cache_key
+        from lightrag.llm_cache import generate_cache_key
 
         # Early return if data is empty
         if not data:

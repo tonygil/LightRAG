@@ -4,7 +4,6 @@ import weakref
 import sys
 
 import asyncio
-import html
 import csv
 import inspect
 import json
@@ -12,23 +11,15 @@ import logging
 import logging.handlers
 import os
 import re
-import tempfile
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
-from hashlib import md5
 from typing import (
     Any,
-    Protocol,
     Callable,
     TYPE_CHECKING,
-    List,
     Optional,
-    Iterable,
-    Sequence,
-    Collection,
 )
 import numpy as np
 from dotenv import load_dotenv
@@ -37,18 +28,9 @@ from lightrag.constants import (
     DEFAULT_LOG_MAX_BYTES,
     DEFAULT_LOG_BACKUP_COUNT,
     DEFAULT_LOG_FILENAME,
-    GRAPH_FIELD_SEP,
-    DEFAULT_MAX_TOTAL_TOKENS,
-    DEFAULT_SOURCE_IDS_LIMIT_METHOD,
-    VALID_SOURCE_IDS_LIMIT_METHODS,
-    SOURCE_IDS_LIMIT_METHOD_FIFO,
 )
 from lightrag.config import PipelineConfig
-
-# Precompile regex pattern for JSON sanitization (module-level, compiled once)
-_SURROGATE_PATTERN = re.compile(r"[\uD800-\uDFFF\uFFFE\uFFFF]")
-_CONTROL_CHAR_PATTERN_ALL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
-
+from lightrag.exceptions import PipelineCancelledException
 
 class SafeStreamHandler(logging.StreamHandler):
     """StreamHandler that gracefully handles closed streams during shutdown.
@@ -74,7 +56,6 @@ class SafeStreamHandler(logging.StreamHandler):
             # Stream is closed or otherwise unavailable, silently ignore
             pass
 
-
 # Initialize logger with basic configuration
 logger = logging.getLogger("lightrag")
 logger.propagate = False  # prevent log message send to root logger
@@ -90,7 +71,6 @@ if not logger.handlers:
 
 # Set httpx logging level to WARNING
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
 
 def _patch_ascii_colors_console_handler() -> None:
     """Prevent ascii_colors from printing flush errors during interpreter exit."""
@@ -114,9 +94,7 @@ def _patch_ascii_colors_console_handler() -> None:
     ConsoleHandler.handle_error = _safe_handle_error  # type: ignore[assignment]
     ConsoleHandler._lightrag_patched = True  # type: ignore[attr-defined]
 
-
 _patch_ascii_colors_console_handler()
-
 
 # Global import for pypinyin with startup-time logging
 try:
@@ -130,7 +108,6 @@ except ImportError:
     logger.warning(
         "pypinyin is not installed. Chinese pinyin sorting will use simple string sorting."
     )
-
 
 async def safe_vdb_operation_with_exception(
     operation: Callable,
@@ -174,7 +151,6 @@ async def safe_vdb_operation_with_exception(
                 )
                 if retry_delay > 0:
                     await asyncio.sleep(retry_delay)
-
 
 def get_env_value(
     env_key: str, default: any, value_type: type = str, special_none: bool = False
@@ -227,7 +203,6 @@ def get_env_value(
     except (ValueError, TypeError):
         return default
 
-
 # Use TYPE_CHECKING to avoid circular imports
 if TYPE_CHECKING:
     from lightrag.base import BaseKVStorage, BaseVectorStorage, QueryParam
@@ -241,7 +216,6 @@ VERBOSE_DEBUG = os.getenv("VERBOSE", "false").lower() == "true"
 PERFORMANCE_TIMING_LOGS = (
     os.getenv("LIGHTRAG_PERFORMANCE_TIMING_LOGS", "false").lower() == "true"
 )
-
 
 def verbose_debug(msg: str, *args, **kwargs):
     """Function for outputting detailed debug information.
@@ -269,21 +243,15 @@ def verbose_debug(msg: str, *args, **kwargs):
         truncated_msg = re.sub(r"\n+", "\n", truncated_msg)
         logger.debug(truncated_msg, **kwargs)
 
-
 def set_verbose_debug(enabled: bool):
     """Enable or disable verbose debug output"""
     global VERBOSE_DEBUG
     VERBOSE_DEBUG = enabled
 
-
 def performance_timing_log(msg: str, *args, **kwargs):
     """Emit targeted performance timing logs only when explicitly enabled."""
     if PERFORMANCE_TIMING_LOGS:
         logger.info(msg, *args, **kwargs)
-
-
-statistic_data = {"llm_call": 0, "llm_cache": 0, "embed_call": 0}
-
 
 class LightragPathFilter(logging.Filter):
     """Filter for lightrag logger to filter out frequent path access logs"""
@@ -325,7 +293,6 @@ class LightragPathFilter(logging.Filter):
         except Exception:
             # In case of any error, let the message through
             return True
-
 
 def setup_logger(
     logger_name: str,
@@ -396,7 +363,6 @@ def setup_logger(
         path_filter = LightragPathFilter()
         logger_instance.addFilter(path_filter)
 
-
 class UnlimitedSemaphore:
     """A context manager that allows unlimited access."""
 
@@ -406,6 +372,32 @@ class UnlimitedSemaphore:
     async def __aexit__(self, exc_type, exc, tb):
         pass
 
+class CancellationToken:
+    """Bundles pipeline_status dict + asyncio.Lock into one object.
+
+    Replaces the (pipeline_status: dict, pipeline_status_lock: asyncio.Lock) pair
+    threaded through extraction and merge stages.
+    """
+
+    __slots__ = ("_status", "_lock")
+
+    def __init__(self, status: dict, lock: "asyncio.Lock") -> None:
+        self._status = status
+        self._lock = lock
+
+    @property
+    def is_cancelled(self) -> bool:
+        return bool(self._status.get("cancellation_requested"))
+
+    async def raise_if_cancelled(self) -> None:
+        async with self._lock:
+            if self._status.get("cancellation_requested"):
+                raise PipelineCancelledException()
+
+    async def post_status(self, message: str) -> None:
+        async with self._lock:
+            self._status["latest_message"] = message
+            self._status["history_messages"].append(message)
 
 @dataclass
 class TaskState:
@@ -417,7 +409,6 @@ class TaskState:
     worker_started: bool = False
     cancellation_requested: bool = False
     cleanup_done: bool = False
-
 
 @dataclass
 class EmbeddingFunc:
@@ -538,89 +529,11 @@ class EmbeddingFunc:
 
         return result
 
-
-def compute_args_hash(*args: Any) -> str:
-    """Compute a hash for the given arguments with safe Unicode handling.
-
-    Args:
-        *args: Arguments to hash
-    Returns:
-        str: Hash string
-    """
-    # Convert all arguments to strings and join them
-    args_str = "".join([str(arg) for arg in args])
-
-    # Use 'replace' error handling to safely encode problematic Unicode characters
-    # This replaces invalid characters with Unicode replacement character (U+FFFD)
-    try:
-        return md5(args_str.encode("utf-8")).hexdigest()
-    except UnicodeEncodeError:
-        # Handle surrogate characters and other encoding issues
-        safe_bytes = args_str.encode("utf-8", errors="replace")
-        return md5(safe_bytes).hexdigest()
-
-
-def compute_mdhash_id(content: str, prefix: str = "") -> str:
-    """
-    Compute a unique ID for a given content string.
-
-    The ID is a combination of the given prefix and the MD5 hash of the content string.
-    """
-    return prefix + compute_args_hash(content)
-
-
-def make_relation_vdb_ids(src_entity: str, tgt_entity: str) -> list[str]:
-    """Return candidate relation VDB IDs for an undirected edge.
-
-    The normalized ID is returned first for all new writes. The reverse-order ID is
-    kept as a compatibility fallback for historical custom-KG imports that hashed
-    the relation using the original endpoint order.
-    """
-    normalized_src, normalized_tgt = sorted((src_entity, tgt_entity))
-    relation_ids = [compute_mdhash_id(normalized_src + normalized_tgt, prefix="rel-")]
-    reverse_relation_id = compute_mdhash_id(
-        normalized_tgt + normalized_src, prefix="rel-"
-    )
-    if reverse_relation_id not in relation_ids:
-        relation_ids.append(reverse_relation_id)
-    return relation_ids
-
-
-def generate_cache_key(mode: str, cache_type: str, hash_value: str) -> str:
-    """Generate a flattened cache key in the format {mode}:{cache_type}:{hash}
-
-    Args:
-        mode: Cache mode (e.g., 'default', 'local', 'global')
-        cache_type: Type of cache (e.g., 'extract', 'query', 'keywords')
-        hash_value: Hash value from compute_args_hash
-
-    Returns:
-        str: Flattened cache key
-    """
-    return f"{mode}:{cache_type}:{hash_value}"
-
-
-def parse_cache_key(cache_key: str) -> tuple[str, str, str] | None:
-    """Parse a flattened cache key back into its components
-
-    Args:
-        cache_key: Flattened cache key in format {mode}:{cache_type}:{hash}
-
-    Returns:
-        tuple[str, str, str] | None: (mode, cache_type, hash) or None if invalid format
-    """
-    parts = cache_key.split(":", 2)
-    if len(parts) == 3:
-        return parts[0], parts[1], parts[2]
-    return None
-
-
 # Custom exception classes
 class QueueFullError(Exception):
     """Raised when the queue is full and the wait times out"""
 
     pass
-
 
 class WorkerTimeoutError(Exception):
     """Worker-level timeout exception with specific timeout information"""
@@ -629,7 +542,6 @@ class WorkerTimeoutError(Exception):
         self.timeout_value = timeout_value
         self.timeout_type = timeout_type
         super().__init__(f"Worker {timeout_type} timeout after {timeout_value}s")
-
 
 class HealthCheckTimeoutError(Exception):
     """Health Check-level timeout exception"""
@@ -640,7 +552,6 @@ class HealthCheckTimeoutError(Exception):
         super().__init__(
             f"Task forcefully terminated due to execution timeout (>{timeout_value}s, actual: {execution_duration:.1f}s)"
         )
-
 
 def priority_limit_async_func_call(
     max_size: int,
@@ -1086,7 +997,6 @@ def priority_limit_async_func_call(
 
     return final_decro
 
-
 def wrap_embedding_func_with_attrs(**kwargs):
     """Decorator to add embedding dimension and token limit attributes to embedding functions.
 
@@ -1144,393 +1054,12 @@ def wrap_embedding_func_with_attrs(**kwargs):
 
     return final_decro
 
-
-def load_json(file_name):
-    if not os.path.exists(file_name):
-        return None
-    with open(file_name, encoding="utf-8-sig") as f:
-        return json.load(f)
-
-
-def _sanitize_string_for_json(text: str) -> str:
-    """Remove characters that cannot be encoded in UTF-8 for JSON serialization.
-
-    Uses regex for optimal performance with zero-copy optimization for clean strings.
-    Fast detection path for clean strings (99% of cases) with efficient removal for dirty strings.
-
-    Args:
-        text: String to sanitize
-
-    Returns:
-        Original string if clean (zero-copy), sanitized string if dirty
-    """
-    if not text:
-        return text
-
-    # Fast path: Check if sanitization is needed using C-level regex search
-    if not _SURROGATE_PATTERN.search(text):
-        return text  # Zero-copy for clean strings - most common case
-
-    # Slow path: Remove problematic characters using C-level regex substitution
-    return _SURROGATE_PATTERN.sub("", text)
-
-
-class SanitizingJSONEncoder(json.JSONEncoder):
-    """
-    Custom JSON encoder that sanitizes data during serialization.
-
-    This encoder cleans strings during the encoding process without creating
-    a full copy of the data structure, making it memory-efficient for large datasets.
-    """
-
-    def encode(self, o):
-        """Override encode method to handle simple string cases"""
-        if isinstance(o, str):
-            return json.encoder.encode_basestring(_sanitize_string_for_json(o))
-        return super().encode(o)
-
-    def iterencode(self, o, _one_shot=False):
-        """
-        Override iterencode to sanitize strings during serialization.
-        This is the core method that handles complex nested structures.
-        """
-        # Preprocess: sanitize all strings in the object
-        sanitized = self._sanitize_for_encoding(o)
-
-        # Call parent's iterencode with sanitized data
-        for chunk in super().iterencode(sanitized, _one_shot):
-            yield chunk
-
-    def _sanitize_for_encoding(self, obj):
-        """
-        Recursively sanitize strings in an object.
-        Creates new objects only when necessary to avoid deep copies.
-
-        Args:
-            obj: Object to sanitize
-
-        Returns:
-            Sanitized object with cleaned strings
-        """
-        if isinstance(obj, str):
-            return _sanitize_string_for_json(obj)
-
-        elif isinstance(obj, dict):
-            # Create new dict with sanitized keys and values
-            new_dict = {}
-            for k, v in obj.items():
-                clean_k = _sanitize_string_for_json(k) if isinstance(k, str) else k
-                clean_v = self._sanitize_for_encoding(v)
-                new_dict[clean_k] = clean_v
-            return new_dict
-
-        elif isinstance(obj, (list, tuple)):
-            # Sanitize list/tuple elements
-            cleaned = [self._sanitize_for_encoding(item) for item in obj]
-            return type(obj)(cleaned) if isinstance(obj, tuple) else cleaned
-
-        else:
-            # Numbers, booleans, None, etc. remain unchanged
-            return obj
-
-
-def write_json(json_obj, file_name):
-    """
-    Write JSON data to file with optimized sanitization strategy.
-
-    This function uses a two-stage approach:
-    1. Fast path: Try direct serialization (works for clean data ~99% of time)
-    2. Slow path: Use custom encoder that sanitizes during serialization
-
-    The custom encoder approach avoids creating a deep copy of the data,
-    making it memory-efficient. When sanitization occurs, the caller should
-    reload the cleaned data from the file to update shared memory.
-
-    Args:
-        json_obj: Object to serialize (may be a shallow copy from shared memory)
-        file_name: Output file path
-
-    Returns:
-        bool: True if sanitization was applied (caller should reload data),
-              False if direct write succeeded (no reload needed)
-    """
-    dir_name = os.path.dirname(os.path.abspath(file_name))
-    try:
-        # Strategy 1: Fast path — write to temp file then rename (atomic, avoids
-        # Windows Defender locking the target file mid-write on large JSON files)
-        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(json_obj, f, indent=2, ensure_ascii=False)
-            os.replace(tmp_path, file_name)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-        return False  # No sanitization needed, no reload required
-
-    except (UnicodeEncodeError, UnicodeDecodeError) as e:
-        logger.debug(f"Direct JSON write failed, using sanitizing encoder: {e}")
-
-    # Strategy 2: Use custom encoder (sanitizes during serialization, zero memory copy)
-    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(json_obj, f, indent=2, ensure_ascii=False, cls=SanitizingJSONEncoder)
-        os.replace(tmp_path, file_name)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-    logger.info(f"JSON sanitization applied during write: {file_name}")
-    return True  # Sanitization applied, reload recommended
-
-
-class TokenizerInterface(Protocol):
-    """
-    Defines the interface for a tokenizer, requiring encode and decode methods.
-    """
-
-    def encode(self, content: str) -> List[int]:
-        """Encodes a string into a list of tokens."""
-        ...
-
-    def decode(self, tokens: List[int]) -> str:
-        """Decodes a list of tokens into a string."""
-        ...
-
-
-class Tokenizer:
-    """
-    A wrapper around a tokenizer to provide a consistent interface for encoding and decoding.
-    """
-
-    def __init__(self, model_name: str, tokenizer: TokenizerInterface):
-        """
-        Initializes the Tokenizer with a tokenizer model name and a tokenizer instance.
-
-        Args:
-            model_name: The associated model name for the tokenizer.
-            tokenizer: An instance of a class implementing the TokenizerInterface.
-        """
-        self.model_name: str = model_name
-        self.tokenizer: TokenizerInterface = tokenizer
-
-    def encode(self, content: str) -> List[int]:
-        """
-        Encodes a string into a list of tokens using the underlying tokenizer.
-
-        Args:
-            content: The string to encode.
-
-        Returns:
-            A list of integer tokens.
-        """
-        return self.tokenizer.encode(content)
-
-    def decode(self, tokens: List[int]) -> str:
-        """
-        Decodes a list of tokens into a string using the underlying tokenizer.
-
-        Args:
-            tokens: A list of integer tokens to decode.
-
-        Returns:
-            The decoded string.
-        """
-        return self.tokenizer.decode(tokens)
-
-
-class TiktokenTokenizer(Tokenizer):
-    """
-    A Tokenizer implementation using the tiktoken library.
-    """
-
-    def __init__(self, model_name: str = "gpt-4o-mini"):
-        """
-        Initializes the TiktokenTokenizer with a specified model name.
-
-        Args:
-            model_name: The model name for the tiktoken tokenizer to use.  Defaults to "gpt-4o-mini".
-
-        Raises:
-            ImportError: If tiktoken is not installed.
-            ValueError: If the model_name is invalid.
-        """
-        try:
-            import tiktoken
-        except ImportError:
-            raise ImportError(
-                "tiktoken is not installed. Please install it with `pip install tiktoken` or define custom `tokenizer_func`."
-            )
-
-        try:
-            tokenizer = tiktoken.encoding_for_model(model_name)
-            super().__init__(model_name=model_name, tokenizer=tokenizer)
-        except KeyError:
-            raise ValueError(f"Invalid model_name: {model_name}.")
-
-
-def pack_user_ass_to_openai_messages(*args: str):
-    roles = ["user", "assistant"]
-    return [
-        {"role": roles[i % 2], "content": content} for i, content in enumerate(args)
-    ]
-
-
-def split_string_by_multi_markers(content: str, markers: list[str]) -> list[str]:
-    """Split a string by multiple markers"""
-    if not markers:
-        return [content]
-    content = content if content is not None else ""
-    results = re.split("|".join(re.escape(marker) for marker in markers), content)
-    return [r.strip() for r in results if r.strip()]
-
-
-def is_float_regex(value: str) -> bool:
-    return bool(re.match(r"^[-+]?[0-9]*\.?[0-9]+$", value))
-
-
-def truncate_list_by_token_size(
-    list_data: list[Any],
-    key: Callable[[Any], str],
-    max_token_size: int,
-    tokenizer: Tokenizer,
-) -> list[int]:
-    """Truncate a list of data by token size"""
-    if max_token_size <= 0:
-        return []
-    tokens = 0
-    for i, data in enumerate(list_data):
-        tokens += len(tokenizer.encode(key(data)))
-        if tokens > max_token_size:
-            return list_data[:i]
-    return list_data
-
-
 def cosine_similarity(v1, v2):
     """Calculate cosine similarity between two vectors"""
     dot_product = np.dot(v1, v2)
     norm1 = np.linalg.norm(v1)
     norm2 = np.linalg.norm(v2)
     return dot_product / (norm1 * norm2)
-
-
-async def handle_cache(
-    hashing_kv,
-    args_hash,
-    prompt,
-    mode="default",
-    cache_type="unknown",
-) -> tuple[str, int] | None:
-    """Generic cache handling function with flattened cache keys
-
-    Returns:
-        tuple[str, int] | None: (content, create_time) if cache hit, None if cache miss
-    """
-    if hashing_kv is None:
-        return None
-
-    if mode != "default":  # handle cache for all type of query
-        if not hashing_kv.global_config.get("enable_llm_cache"):
-            return None
-    else:  # handle cache for entity extraction
-        if not hashing_kv.global_config.get("enable_llm_cache_for_entity_extract"):
-            return None
-
-    # Use flattened cache key format: {mode}:{cache_type}:{hash}
-    flattened_key = generate_cache_key(mode, cache_type, args_hash)
-    cache_entry = await hashing_kv.get_by_id(flattened_key)
-    if cache_entry:
-        logger.debug(f"Flattened cache hit(key:{flattened_key})")
-        content = cache_entry["return"]
-        timestamp = cache_entry.get("create_time", 0)
-        return content, timestamp
-
-    logger.debug(f"Cache missed(mode:{mode} type:{cache_type})")
-    return None
-
-
-@dataclass
-class CacheData:
-    args_hash: str
-    content: str
-    prompt: str
-    mode: str = "default"
-    cache_type: str = "query"
-    chunk_id: str | None = None
-    queryparam: dict | None = None
-
-
-async def save_to_cache(hashing_kv, cache_data: CacheData):
-    """Save data to cache using flattened key structure.
-
-    Args:
-        hashing_kv: The key-value storage for caching
-        cache_data: The cache data to save
-    """
-    # Skip if storage is None or content is a streaming response
-    if hashing_kv is None or not cache_data.content:
-        return
-
-    # If content is a streaming response, don't cache it
-    if hasattr(cache_data.content, "__aiter__"):
-        logger.debug("Streaming response detected, skipping cache")
-        return
-
-    # Use flattened cache key format: {mode}:{cache_type}:{hash}
-    flattened_key = generate_cache_key(
-        cache_data.mode, cache_data.cache_type, cache_data.args_hash
-    )
-
-    # Check if we already have identical content cached
-    existing_cache = await hashing_kv.get_by_id(flattened_key)
-    if existing_cache:
-        existing_content = existing_cache.get("return")
-        if existing_content == cache_data.content:
-            logger.warning(
-                f"Cache duplication detected for {flattened_key}, skipping update"
-            )
-            return
-
-    # Create cache entry with flattened structure
-    cache_entry = {
-        "return": cache_data.content,
-        "cache_type": cache_data.cache_type,
-        "chunk_id": cache_data.chunk_id if cache_data.chunk_id is not None else None,
-        "original_prompt": cache_data.prompt,
-        "queryparam": cache_data.queryparam
-        if cache_data.queryparam is not None
-        else None,
-    }
-
-    logger.info(f" == LLM cache == saving: {flattened_key}")
-
-    # Save using flattened key
-    await hashing_kv.upsert({flattened_key: cache_entry})
-
-
-def safe_unicode_decode(content):
-    # Regular expression to find all Unicode escape sequences of the form \uXXXX
-    unicode_escape_pattern = re.compile(r"\\u([0-9a-fA-F]{4})")
-
-    # Function to replace the Unicode escape with the actual character
-    def replace_unicode_escape(match):
-        # Convert the matched hexadecimal value into the actual Unicode character
-        return chr(int(match.group(1), 16))
-
-    # Perform the substitution
-    decoded_content = unicode_escape_pattern.sub(
-        replace_unicode_escape, content.decode("utf-8")
-    )
-
-    return decoded_content
-
 
 def exists_func(obj, func_name: str) -> bool:
     """Check if a function exists in an object or not.
@@ -1543,7 +1072,6 @@ def exists_func(obj, func_name: str) -> bool:
     else:
         return False
 
-
 async def _cooperative_yield(iteration: int, every: int = 64) -> None:
     """Periodically yield control to the event loop during CPU-heavy async loops.
 
@@ -1552,7 +1080,6 @@ async def _cooperative_yield(iteration: int, every: int = 64) -> None:
     """
     if iteration > 0 and iteration % every == 0:
         await asyncio.sleep(0)
-
 
 def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
     """
@@ -1577,7 +1104,6 @@ def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
         new_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(new_loop)
         return new_loop
-
 
 async def aexport_data(
     chunk_entity_relation_graph,
@@ -1884,7 +1410,6 @@ async def aexport_data(
     else:
         print("Data displayed as table format")
 
-
 def export_data(
     chunk_entity_relation_graph,
     entities_vdb,
@@ -1925,7 +1450,6 @@ def export_data(
         )
     )
 
-
 def lazy_external_import(module_name: str, class_name: str) -> Callable[..., Any]:
     """Lazily import a class from an external module based on the package of the caller."""
     # Get the caller's module and package
@@ -1943,417 +1467,6 @@ def lazy_external_import(module_name: str, class_name: str) -> Callable[..., Any
         return cls(*args, **kwargs)
 
     return import_class
-
-
-async def update_chunk_cache_list(
-    chunk_id: str,
-    text_chunks_storage: "BaseKVStorage",
-    cache_keys: list[str],
-    cache_scenario: str = "batch_update",
-) -> None:
-    """Update chunk's llm_cache_list with the given cache keys
-
-    Args:
-        chunk_id: Chunk identifier
-        text_chunks_storage: Text chunks storage instance
-        cache_keys: List of cache keys to add to the list
-        cache_scenario: Description of the cache scenario for logging
-    """
-    if not cache_keys:
-        return
-
-    try:
-        chunk_data = await text_chunks_storage.get_by_id(chunk_id)
-        if chunk_data:
-            # Ensure llm_cache_list exists
-            if "llm_cache_list" not in chunk_data:
-                chunk_data["llm_cache_list"] = []
-
-            # Add cache keys to the list if not already present
-            existing_keys = set(chunk_data["llm_cache_list"])
-            new_keys = [key for key in cache_keys if key not in existing_keys]
-
-            if new_keys:
-                chunk_data["llm_cache_list"].extend(new_keys)
-
-                # Update the chunk in storage
-                await text_chunks_storage.upsert({chunk_id: chunk_data})
-                logger.debug(
-                    f"Updated chunk {chunk_id} with {len(new_keys)} cache keys ({cache_scenario})"
-                )
-    except Exception as e:
-        logger.warning(
-            f"Failed to update chunk {chunk_id} with cache references on {cache_scenario}: {e}"
-        )
-
-
-def remove_think_tags(text: str) -> str:
-    """Remove <think>...</think> tags and their content from the text.
-
-    Handles two cases:
-    1. Complete <think>...</think> blocks anywhere in the text.
-    2. Orphaned </think> at the very start (e.g., from streaming that begins
-       mid-think-block), removing everything before and including it.
-    """
-    # First, remove orphaned </think> prefix (content before first </think>
-    # when there is no preceding <think> tag)
-    text = re.sub(r"^((?!<think>).)*?</think>", "", text, flags=re.DOTALL)
-    # Then remove all complete <think>...</think> blocks
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    return text.strip()
-
-
-async def use_llm_func_with_cache(
-    user_prompt: str,
-    use_llm_func: callable,
-    llm_response_cache: "BaseKVStorage | None" = None,
-    system_prompt: str | None = None,
-    max_tokens: int = None,
-    history_messages: list[dict[str, str]] = None,
-    cache_type: str = "extract",
-    chunk_id: str | None = None,
-    cache_keys_collector: list = None,
-) -> tuple[str, int]:
-    """Call LLM function with cache support and text sanitization
-
-    If cache is available and enabled (determined by handle_cache based on mode),
-    retrieve result from cache; otherwise call LLM function and save result to cache.
-
-    This function applies text sanitization to prevent UTF-8 encoding errors for all LLM providers.
-
-    Args:
-        input_text: Input text to send to LLM
-        use_llm_func: LLM function with higher priority
-        llm_response_cache: Cache storage instance
-        max_tokens: Maximum tokens for generation
-        history_messages: History messages list
-        cache_type: Type of cache
-        chunk_id: Chunk identifier to store in cache
-        text_chunks_storage: Text chunks storage to update llm_cache_list
-        cache_keys_collector: Optional list to collect cache keys for batch processing
-
-    Returns:
-        tuple[str, int]: (LLM response text, timestamp)
-            - For cache hits: (content, cache_create_time)
-            - For cache misses: (content, current_timestamp)
-    """
-    # Sanitize input text to prevent UTF-8 encoding errors for all LLM providers
-    safe_user_prompt = sanitize_text_for_encoding(user_prompt)
-    safe_system_prompt = (
-        sanitize_text_for_encoding(system_prompt) if system_prompt else None
-    )
-
-    # Sanitize history messages if provided
-    safe_history_messages = None
-    if history_messages:
-        safe_history_messages = []
-        for i, msg in enumerate(history_messages):
-            safe_msg = msg.copy()
-            if "content" in safe_msg:
-                safe_msg["content"] = sanitize_text_for_encoding(safe_msg["content"])
-            safe_history_messages.append(safe_msg)
-        history = json.dumps(safe_history_messages, ensure_ascii=False)
-    else:
-        history = None
-
-    if llm_response_cache:
-        prompt_parts = []
-        if safe_user_prompt:
-            prompt_parts.append(safe_user_prompt)
-        if safe_system_prompt:
-            prompt_parts.append(safe_system_prompt)
-        if history:
-            prompt_parts.append(history)
-        _prompt = "\n".join(prompt_parts)
-
-        arg_hash = compute_args_hash(_prompt)
-        # Generate cache key for this LLM call
-        cache_key = generate_cache_key("default", cache_type, arg_hash)
-
-        cached_result = await handle_cache(
-            llm_response_cache,
-            arg_hash,
-            _prompt,
-            "default",
-            cache_type=cache_type,
-        )
-        if cached_result:
-            content, timestamp = cached_result
-            logger.debug(f"Found cache for {arg_hash}")
-            statistic_data["llm_cache"] += 1
-
-            # Add cache key to collector if provided
-            if cache_keys_collector is not None:
-                cache_keys_collector.append(cache_key)
-
-            return content, timestamp
-        statistic_data["llm_call"] += 1
-
-        # Call LLM with sanitized input
-        kwargs = {}
-        if safe_history_messages:
-            kwargs["history_messages"] = safe_history_messages
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
-
-        res: str = await use_llm_func(
-            safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
-        )
-
-        res = remove_think_tags(res)
-
-        # Generate timestamp for cache miss (LLM call completion time)
-        current_timestamp = int(time.time())
-
-        if llm_response_cache.global_config.get("enable_llm_cache_for_entity_extract"):
-            await save_to_cache(
-                llm_response_cache,
-                CacheData(
-                    args_hash=arg_hash,
-                    content=res,
-                    prompt=_prompt,
-                    cache_type=cache_type,
-                    chunk_id=chunk_id,
-                ),
-            )
-
-            # Add cache key to collector if provided
-            if cache_keys_collector is not None:
-                cache_keys_collector.append(cache_key)
-
-        return res, current_timestamp
-
-    # When cache is disabled, directly call LLM with sanitized input
-    kwargs = {}
-    if safe_history_messages:
-        kwargs["history_messages"] = safe_history_messages
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
-
-    try:
-        res = await use_llm_func(
-            safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
-        )
-    except Exception as e:
-        # Add [LLM func] prefix to error message
-        error_msg = f"[LLM func] {str(e)}"
-        # Re-raise with the same exception type but modified message
-        raise type(e)(error_msg) from e
-
-    # Generate timestamp for non-cached LLM call
-    current_timestamp = int(time.time())
-    return remove_think_tags(res), current_timestamp
-
-
-def get_content_summary(content: str, max_length: int = 250) -> str:
-    """Get summary of document content
-
-    Args:
-        content: Original document content
-        max_length: Maximum length of summary
-
-    Returns:
-        Truncated content with ellipsis if needed
-    """
-    content = content.strip()
-    if len(content) <= max_length:
-        return content
-    return content[:max_length] + "..."
-
-
-def sanitize_and_normalize_extracted_text(
-    input_text: str, remove_inner_quotes=False
-) -> str:
-    """Santitize and normalize extracted text
-    Args:
-        input_text: text string to be processed
-        is_name: whether the input text is a entity or relation name
-
-    Returns:
-        Santitized and normalized text string
-    """
-    safe_input_text = sanitize_text_for_encoding(input_text)
-    if safe_input_text:
-        normalized_text = normalize_extracted_info(
-            safe_input_text, remove_inner_quotes=remove_inner_quotes
-        )
-        return normalized_text
-    return ""
-
-
-def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
-    """Normalize entity/relation names and description with the following rules:
-    - Clean HTML tags (paragraph and line break tags)
-    - Convert Chinese symbols to English symbols
-    - Remove spaces between Chinese characters
-    - Remove spaces between Chinese characters and English letters/numbers
-    - Preserve spaces within English text and numbers
-    - Replace Chinese parentheses with English parentheses
-    - Replace Chinese dash with English dash
-    - Remove English quotation marks from the beginning and end of the text
-    - Remove English quotation marks in and around chinese
-    - Remove Chinese quotation marks
-    - Filter out short numeric-only text (length < 3 and only digits/dots)
-    - remove_inner_quotes = True
-        remove Chinese quotes
-        remove English quotes in and around chinese
-        Convert non-breaking spaces to regular spaces
-        Convert narrow non-breaking spaces after non-digits to regular spaces
-
-    Args:
-        name: Entity name to normalize
-        is_entity: Whether this is an entity name (affects quote handling)
-
-    Returns:
-        Normalized entity name
-    """
-    # Clean HTML tags - remove paragraph and line break tags
-    name = re.sub(r"</p\s*>|<p\s*>|<p/>", "", name, flags=re.IGNORECASE)
-    name = re.sub(r"</br\s*>|<br\s*>|<br/>", "", name, flags=re.IGNORECASE)
-
-    # Chinese full-width letters to half-width (A-Z, a-z)
-    name = name.translate(
-        str.maketrans(
-            "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
-        )
-    )
-
-    # Chinese full-width numbers to half-width
-    name = name.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
-
-    # Chinese full-width symbols to half-width
-    name = name.replace("－", "-")  # Chinese minus
-    name = name.replace("＋", "+")  # Chinese plus
-    name = name.replace("／", "/")  # Chinese slash
-    name = name.replace("＊", "*")  # Chinese asterisk
-
-    # Replace Chinese parentheses with English parentheses
-    name = name.replace("（", "(").replace("）", ")")
-
-    # Replace Chinese dash with English dash (additional patterns)
-    name = name.replace("—", "-").replace("－", "-")
-
-    # Chinese full-width space to regular space (after other replacements)
-    name = name.replace("　", " ")
-
-    # Use regex to remove spaces between Chinese characters
-    # Regex explanation:
-    # (?<=[\u4e00-\u9fa5]): Positive lookbehind for Chinese character
-    # \s+: One or more whitespace characters
-    # (?=[\u4e00-\u9fa5]): Positive lookahead for Chinese character
-    name = re.sub(r"(?<=[\u4e00-\u9fa5])\s+(?=[\u4e00-\u9fa5])", "", name)
-
-    # Remove spaces between Chinese and English/numbers/symbols
-    name = re.sub(
-        r"(?<=[\u4e00-\u9fa5])\s+(?=[a-zA-Z0-9\(\)\[\]@#$%!&\*\-=+_])", "", name
-    )
-    name = re.sub(
-        r"(?<=[a-zA-Z0-9\(\)\[\]@#$%!&\*\-=+_])\s+(?=[\u4e00-\u9fa5])", "", name
-    )
-
-    # Remove outer quotes
-    if len(name) >= 2:
-        # Handle double quotes
-        if name.startswith('"') and name.endswith('"'):
-            inner_content = name[1:-1]
-            if '"' not in inner_content:  # No double quotes inside
-                name = inner_content
-
-        # Handle single quotes
-        if name.startswith("'") and name.endswith("'"):
-            inner_content = name[1:-1]
-            if "'" not in inner_content:  # No single quotes inside
-                name = inner_content
-
-        # Handle Chinese-style double quotes
-        if name.startswith("“") and name.endswith("”"):
-            inner_content = name[1:-1]
-            if "“" not in inner_content and "”" not in inner_content:
-                name = inner_content
-        if name.startswith("‘") and name.endswith("’"):
-            inner_content = name[1:-1]
-            if "‘" not in inner_content and "’" not in inner_content:
-                name = inner_content
-
-        # Handle Chinese-style book title mark
-        if name.startswith("《") and name.endswith("》"):
-            inner_content = name[1:-1]
-            if "《" not in inner_content and "》" not in inner_content:
-                name = inner_content
-
-    if remove_inner_quotes:
-        # Remove Chinese quotes
-        name = name.replace("“", "").replace("”", "").replace("‘", "").replace("’", "")
-        # Remove English queotes in and around chinese
-        name = re.sub(r"['\"]+(?=[\u4e00-\u9fa5])", "", name)
-        name = re.sub(r"(?<=[\u4e00-\u9fa5])['\"]+", "", name)
-        # Convert non-breaking space to regular space
-        name = name.replace("\u00a0", " ")
-        # Convert narrow non-breaking space to regular space when after non-digits
-        name = re.sub(r"(?<=[^\d])\u202F", " ", name)
-
-    # Remove spaces from the beginning and end of the text
-    name = name.strip()
-
-    # Filter out pure numeric content with length < 3
-    if len(name) < 3 and re.match(r"^[0-9]+$", name):
-        return ""
-
-    def should_filter_by_dots(text):
-        """
-        Check if the string consists only of dots and digits, with at least one dot
-        Filter cases include: 1.2.3, 12.3, .123, 123., 12.3., .1.23 etc.
-        """
-        return all(c.isdigit() or c == "." for c in text) and "." in text
-
-    if len(name) < 6 and should_filter_by_dots(name):
-        # Filter out mixed numeric and dot content with length < 6, requiring at least one dot
-        return ""
-
-    return name
-
-
-def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
-    """Sanitize text to ensure safe UTF-8 encoding by removing or replacing problematic characters.
-
-    This function handles:
-    - Surrogate characters (the main cause of encoding errors)
-    - Other invalid Unicode sequences
-    - Control characters that might cause issues
-    - Unescape HTML escapes
-    - Remove control characters
-    - Whitespace trimming
-
-    Args:
-        text: Input text to sanitize
-        replacement_char: Character to use for replacing invalid sequences
-
-    Returns:
-        Sanitized text that can be safely encoded as UTF-8
-    """
-    if not text:
-        return text
-
-    # First, strip whitespace
-    text = text.strip()
-
-    # Early return if text is empty after basic cleaning
-    if not text:
-        return text
-
-    # 1. html.unescape first to catch entities that might become surrogates or control chars
-    text = html.unescape(text)
-
-    # 2. Use pre-compiled regex to clean surrogates and non-characters in one pass
-    # This replaces the slow manual loop and initial .encode() check
-    text = _SURROGATE_PATTERN.sub(replacement_char, text)
-
-    # 3. Remove control characters but preserve common whitespace (\t, \n, \r)
-    text = _CONTROL_CHAR_PATTERN_ALL.sub(replacement_char, text)
-
-    return text.strip()
-
 
 def check_storage_env_vars(storage_name: str) -> None:
     """Check if all required environment variables for storage implementation exist
@@ -2374,7 +1487,6 @@ def check_storage_env_vars(storage_name: str) -> None:
             f"Storage implementation '{storage_name}' requires the following "
             f"environment variables: {', '.join(missing_vars)}"
         )
-
 
 def pick_by_weighted_polling(
     entities_or_relations: list[dict],
@@ -2454,7 +1566,6 @@ def pick_by_weighted_polling(
             break
 
     return selected_chunks
-
 
 async def pick_by_vector_similarity(
     query: str,
@@ -2578,64 +1689,6 @@ async def pick_by_vector_similarity(
         logger.debug("[VECTOR_SIMILARITY] Falling back to simple truncation")
         return all_chunk_ids[:num_of_chunks]
 
-
-class TokenTracker:
-    """Track token usage for LLM calls."""
-
-    def __init__(self):
-        self.reset()
-
-    def __enter__(self):
-        self.reset()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        print(self)
-
-    def reset(self):
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
-        self.total_tokens = 0
-        self.call_count = 0
-
-    def add_usage(self, token_counts):
-        """Add token usage from one LLM call.
-
-        Args:
-            token_counts: A dictionary containing prompt_tokens, completion_tokens, total_tokens
-        """
-        self.prompt_tokens += token_counts.get("prompt_tokens", 0)
-        self.completion_tokens += token_counts.get("completion_tokens", 0)
-
-        # If total_tokens is provided, use it directly; otherwise calculate the sum
-        if "total_tokens" in token_counts:
-            self.total_tokens += token_counts["total_tokens"]
-        else:
-            self.total_tokens += token_counts.get(
-                "prompt_tokens", 0
-            ) + token_counts.get("completion_tokens", 0)
-
-        self.call_count += 1
-
-    def get_usage(self):
-        """Get current usage statistics."""
-        return {
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens,
-            "call_count": self.call_count,
-        }
-
-    def __str__(self):
-        usage = self.get_usage()
-        return (
-            f"LLM call count: {usage['call_count']}, "
-            f"Prompt tokens: {usage['prompt_tokens']}, "
-            f"Completion tokens: {usage['completion_tokens']}, "
-            f"Total tokens: {usage['total_tokens']}"
-        )
-
-
 async def apply_rerank_if_enabled(
     query: str,
     retrieved_docs: list[dict],
@@ -2718,7 +1771,6 @@ async def apply_rerank_if_enabled(
     except Exception as e:
         logger.error(f"Error during reranking: {e}, using original chunks")
         return retrieved_docs
-
 
 async def process_chunks_unified(
     query: str,
@@ -2827,159 +1879,6 @@ async def process_chunks_unified(
 
     return final_chunks
 
-
-def normalize_source_ids_limit_method(method: str | None) -> str:
-    """Normalize the source ID limiting strategy and fall back to default when invalid."""
-
-    if not method:
-        return DEFAULT_SOURCE_IDS_LIMIT_METHOD
-
-    normalized = method.upper()
-    if normalized not in VALID_SOURCE_IDS_LIMIT_METHODS:
-        logger.warning(
-            "Unknown SOURCE_IDS_LIMIT_METHOD '%s', falling back to %s",
-            method,
-            DEFAULT_SOURCE_IDS_LIMIT_METHOD,
-        )
-        return DEFAULT_SOURCE_IDS_LIMIT_METHOD
-
-    return normalized
-
-
-def merge_source_ids(
-    existing_ids: Iterable[str] | None, new_ids: Iterable[str] | None
-) -> list[str]:
-    """Merge two iterables of source IDs while preserving order and removing duplicates."""
-
-    merged: list[str] = []
-    seen: set[str] = set()
-
-    for sequence in (existing_ids, new_ids):
-        if not sequence:
-            continue
-        for source_id in sequence:
-            if not source_id:
-                continue
-            if source_id not in seen:
-                seen.add(source_id)
-                merged.append(source_id)
-
-    return merged
-
-
-def apply_source_ids_limit(
-    source_ids: Sequence[str],
-    limit: int,
-    method: str,
-    *,
-    identifier: str | None = None,
-) -> list[str]:
-    """Apply a limit strategy to a sequence of source IDs."""
-
-    if limit <= 0:
-        return []
-
-    source_ids_list = list(source_ids)
-    if len(source_ids_list) <= limit:
-        return source_ids_list
-
-    normalized_method = normalize_source_ids_limit_method(method)
-
-    if normalized_method == SOURCE_IDS_LIMIT_METHOD_FIFO:
-        truncated = source_ids_list[-limit:]
-    else:  # IGNORE_NEW
-        truncated = source_ids_list[:limit]
-
-    if identifier and len(truncated) < len(source_ids_list):
-        logger.debug(
-            "Source_id truncated: %s | %s keeping %s of %s entries",
-            identifier,
-            normalized_method,
-            len(truncated),
-            len(source_ids_list),
-        )
-
-    return truncated
-
-
-def compute_incremental_chunk_ids(
-    existing_full_chunk_ids: list[str],
-    old_chunk_ids: list[str],
-    new_chunk_ids: list[str],
-) -> list[str]:
-    """
-    Compute incrementally updated chunk IDs based on changes.
-
-    This function applies delta changes (additions and removals) to an existing
-    list of chunk IDs while maintaining order and ensuring deduplication.
-    Delta additions from new_chunk_ids are placed at the end.
-
-    Args:
-        existing_full_chunk_ids: Complete list of existing chunk IDs from storage
-        old_chunk_ids: Previous chunk IDs from source_id (chunks being replaced)
-        new_chunk_ids: New chunk IDs from updated source_id (chunks being added)
-
-    Returns:
-        Updated list of chunk IDs with deduplication
-
-    Example:
-        >>> existing = ['chunk-1', 'chunk-2', 'chunk-3']
-        >>> old = ['chunk-1', 'chunk-2']
-        >>> new = ['chunk-2', 'chunk-4']
-        >>> compute_incremental_chunk_ids(existing, old, new)
-        ['chunk-3', 'chunk-2', 'chunk-4']
-    """
-    # Calculate changes
-    chunks_to_remove = set(old_chunk_ids) - set(new_chunk_ids)
-    chunks_to_add = set(new_chunk_ids) - set(old_chunk_ids)
-
-    # Apply changes to full chunk_ids
-    # Step 1: Remove chunks that are no longer needed
-    updated_chunk_ids = [
-        cid for cid in existing_full_chunk_ids if cid not in chunks_to_remove
-    ]
-
-    # Step 2: Add new chunks (preserving order from new_chunk_ids)
-    # Note: 'cid not in updated_chunk_ids' check ensures deduplication
-    for cid in new_chunk_ids:
-        if cid in chunks_to_add and cid not in updated_chunk_ids:
-            updated_chunk_ids.append(cid)
-
-    return updated_chunk_ids
-
-
-def subtract_source_ids(
-    source_ids: Iterable[str],
-    ids_to_remove: Collection[str],
-) -> list[str]:
-    """Remove a collection of IDs from an ordered iterable while preserving order."""
-
-    removal_set = set(ids_to_remove)
-    if not removal_set:
-        return [source_id for source_id in source_ids if source_id]
-
-    return [
-        source_id
-        for source_id in source_ids
-        if source_id and source_id not in removal_set
-    ]
-
-
-def make_relation_chunk_key(src: str, tgt: str) -> str:
-    """Create a deterministic storage key for relation chunk tracking."""
-
-    return GRAPH_FIELD_SEP.join(sorted((src, tgt)))
-
-
-def parse_relation_chunk_key(key: str) -> tuple[str, str]:
-    """Parse a relation chunk storage key back into its entity pair."""
-
-    parts = key.split(GRAPH_FIELD_SEP)
-    if len(parts) != 2:
-        raise ValueError(f"Invalid relation chunk key: {key}")
-    return parts[0], parts[1]
-
-
 def generate_track_id(prefix: str = "upload") -> str:
     """Generate a unique tracking ID with timestamp and UUID
 
@@ -2992,7 +1891,6 @@ def generate_track_id(prefix: str = "upload") -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     unique_id = str(uuid.uuid4())[:8]  # Use first 8 characters of UUID
     return f"{prefix}_{timestamp}_{unique_id}"
-
 
 def get_pinyin_sort_key(text: str) -> str:
     """Generate sort key for Chinese pinyin sorting
@@ -3020,125 +1918,6 @@ def get_pinyin_sort_key(text: str) -> str:
     else:
         # pypinyin not available, use simple string sorting
         return text.lower()
-
-
-def fix_tuple_delimiter_corruption(
-    record: str, delimiter_core: str, tuple_delimiter: str
-) -> str:
-    """
-    Fix various forms of tuple_delimiter corruption from LLM output.
-
-    This function handles missing or replaced characters around the core delimiter.
-    It fixes common corruption patterns where the LLM output doesn't match the expected
-    tuple_delimiter format.
-
-    Args:
-        record: The text record to fix
-        delimiter_core: The core delimiter (e.g., "S" from "<|#|>")
-        tuple_delimiter: The complete tuple delimiter (e.g., "<|#|>")
-
-    Returns:
-        The corrected record with proper tuple_delimiter format
-    """
-    if not record or not delimiter_core or not tuple_delimiter:
-        return record
-
-    # Escape the delimiter core for regex use
-    escaped_delimiter_core = re.escape(delimiter_core)
-
-    # Fix: <|##|> -> <|#|>, <|#||#|> -> <|#|>, <|#|||#|> -> <|#|>
-    record = re.sub(
-        rf"<\|{escaped_delimiter_core}\|*?{escaped_delimiter_core}\|>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <|\#|> -> <|#|>
-    record = re.sub(
-        rf"<\|\\{escaped_delimiter_core}\|>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <|> -> <|#|>, <||> -> <|#|>
-    record = re.sub(
-        r"<\|+>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <X|#|> -> <|#|>, <|#|Y> -> <|#|>, <X|#|Y> -> <|#|>, <||#||> -> <|#|> (one extra characters outside pipes)
-    record = re.sub(
-        rf"<.?\|{escaped_delimiter_core}\|.?>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <#>, <#|>, <|#> -> <|#|> (missing one or both pipes)
-    record = re.sub(
-        rf"<\|?{escaped_delimiter_core}\|?>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <X#|> -> <|#|>, <|#X> -> <|#|> (one pipe is replaced by other character)
-    record = re.sub(
-        rf"<[^|]{escaped_delimiter_core}\|>|<\|{escaped_delimiter_core}[^|]>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <|#| -> <|#|>, <|#|| -> <|#|> (missing closing >)
-    record = re.sub(
-        rf"<\|{escaped_delimiter_core}\|+(?!>)",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix <|#: -> <|#|> (missing closing >)
-    record = re.sub(
-        rf"<\|{escaped_delimiter_core}:(?!>)",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <||#> -> <|#|> (double pipe at start, missing pipe at end)
-    record = re.sub(
-        rf"<\|+{escaped_delimiter_core}>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <|| -> <|#|>
-    record = re.sub(
-        r"<\|\|(?!>)",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: |#|> -> <|#|> (missing opening <)
-    record = re.sub(
-        rf"(?<!<)\|{escaped_delimiter_core}\|>",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <|#|>| -> <|#|>  ( this is a fix for: <|#|| -> <|#|> )
-    record = re.sub(
-        rf"<\|{escaped_delimiter_core}\|>\|",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: ||#|| -> <|#|> (double pipes on both sides without angle brackets)
-    record = re.sub(
-        rf"\|\|{escaped_delimiter_core}\|\|",
-        tuple_delimiter,
-        record,
-    )
-
-    return record
-
 
 def create_prefixed_exception(original_exception: Exception, prefix: str) -> Exception:
     """
@@ -3179,7 +1958,6 @@ def create_prefixed_exception(original_exception: Exception, prefix: str) -> Exc
         return RuntimeError(
             f"{prefix}: {type(original_exception).__name__}: {str(original_exception)}"
         )
-
 
 def convert_to_user_format(
     entities_context: list[dict],
@@ -3303,7 +2081,6 @@ def convert_to_user_format(
         },
         "metadata": metadata,
     }
-
 
 def generate_reference_list_from_chunks(
     chunks: list[dict],

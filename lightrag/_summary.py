@@ -5,10 +5,12 @@ from functools import partial
 
 from lightrag.utils import (
     logger,
+    _cooperative_yield,
+)
+from lightrag.llm_cache import use_llm_func_with_cache
+from lightrag.tokenization import (
     Tokenizer,
     truncate_list_by_token_size,
-    use_llm_func_with_cache,
-    _cooperative_yield,
 )
 from lightrag.base import (
     BaseKVStorage,

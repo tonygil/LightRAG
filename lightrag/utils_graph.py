@@ -7,7 +7,8 @@ from typing import Any, cast
 from .base import DeletionResult
 from .kg.shared_storage import get_storage_keyed_lock
 from .constants import GRAPH_FIELD_SEP
-from .utils import compute_mdhash_id, logger, make_relation_vdb_ids
+from .utils import logger
+from .text_utils import compute_mdhash_id, make_relation_vdb_ids
 from .base import StorageNameSpace
 
 
@@ -113,7 +114,7 @@ async def adelete_by_entity(
 
             if relation_chunks_storage is not None and edges:
                 # Delete all related relationships from relation_chunks_storage
-                from .utils import make_relation_chunk_key
+                from .text_utils import make_relation_chunk_key
 
                 relation_keys_to_delete = []
                 for src, tgt in edges:
@@ -207,7 +208,7 @@ async def adelete_by_relation(
 
             # Clean up chunk tracking storage before deletion
             if relation_chunks_storage is not None:
-                from .utils import make_relation_chunk_key
+                from .text_utils import make_relation_chunk_key
 
                 # Normalize entity order for consistent key generation
                 normalized_src, normalized_tgt = sorted([source_entity, target_entity])
@@ -399,7 +400,7 @@ async def _edit_entity_impl(
     await entities_vdb.upsert(entity_data)
 
     if entity_chunks_storage is not None or relation_chunks_storage is not None:
-        from .utils import make_relation_chunk_key, compute_incremental_chunk_ids
+        from .text_utils import make_relation_chunk_key, compute_incremental_chunk_ids
 
         if entity_chunks_storage is not None:
             storage_key = original_entity_name if is_renaming else entity_name
@@ -830,7 +831,7 @@ async def aedit_relation(
             #    - source_id has changed (edit scenario)
             #    - relation_chunks_storage has no existing data (migration/initialization scenario)
             if relation_chunks_storage is not None:
-                from .utils import (
+                from .text_utils import (
                     make_relation_chunk_key,
                     compute_incremental_chunk_ids,
                 )
@@ -1140,7 +1141,7 @@ async def acreate_relation(
 
             # Update relation_chunks_storage to track chunk references
             if relation_chunks_storage is not None:
-                from .utils import make_relation_chunk_key
+                from .text_utils import make_relation_chunk_key
 
                 # Normalize entity order for consistent key generation
                 normalized_src, normalized_tgt = sorted([source_entity, target_entity])
@@ -1310,7 +1311,7 @@ async def _merge_entities_impl(
 
         # Collect old chunk tracking key for deletion
         if relation_chunks_storage is not None:
-            from .utils import make_relation_chunk_key
+            from .text_utils import make_relation_chunk_key
 
             old_storage_key = make_relation_chunk_key(src, tgt)
             old_relation_keys_to_delete.append(old_storage_key)

@@ -17,7 +17,8 @@ from unittest.mock import AsyncMock
 
 from lightrag.kg.networkx_impl import NetworkXStorage
 from lightrag.kg.shared_storage import initialize_share_data
-from lightrag.utils import EmbeddingFunc, make_relation_vdb_ids
+from lightrag.utils import EmbeddingFunc
+from lightrag.text_utils import make_relation_vdb_ids
 
 
 # ---------------------------------------------------------------------------

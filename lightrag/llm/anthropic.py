@@ -32,10 +32,8 @@ from tenacity import (
     wait_exponential,
     retry_if_exception_type,
 )
-from lightrag.utils import (
-    safe_unicode_decode,
-    logger,
-)
+from lightrag.utils import logger
+from lightrag.text_utils import safe_unicode_decode
 from lightrag.api import __api_version__
 
 

@@ -3,10 +3,8 @@ import pytest
 from lightrag.config import PipelineConfig
 from lightrag.constants import SOURCE_IDS_LIMIT_METHOD_KEEP
 from lightrag.constants import GRAPH_FIELD_SEP
-from lightrag.operate import (
-    _merge_nodes_then_upsert,
-    _handle_single_relationship_extraction,
-)
+from lightrag.merge import _merge_nodes_then_upsert
+from lightrag.extraction import _handle_single_relationship_extraction
 from lightrag import utils_graph
 
 

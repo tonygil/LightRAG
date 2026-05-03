@@ -24,9 +24,9 @@ from tenacity import (
 )
 from lightrag.utils import (
     wrap_embedding_func_with_attrs,
-    safe_unicode_decode,
     logger,
 )
+from lightrag.text_utils import safe_unicode_decode
 
 from lightrag.types import GPTKeywordExtractionFormat
 from lightrag.api import __api_version__

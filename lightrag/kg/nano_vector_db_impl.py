@@ -7,10 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 import time
 
-from lightrag.utils import (
-    logger,
-    compute_mdhash_id,
-)
+from lightrag.utils import logger
+from lightrag.text_utils import compute_mdhash_id
 
 from lightrag.base import BaseVectorStorage
 from nano_vectordb import NanoVectorDB

@@ -6,7 +6,8 @@ import json
 import numpy as np
 from dataclasses import dataclass
 
-from lightrag.utils import logger, compute_mdhash_id
+from lightrag.utils import logger
+from lightrag.text_utils import compute_mdhash_id
 from lightrag.base import BaseVectorStorage
 
 from .shared_storage import (

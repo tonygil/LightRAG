@@ -13,7 +13,8 @@ import pipmaster as pm
 from ..base import BaseVectorStorage
 from ..exceptions import DataMigrationError
 from ..kg.shared_storage import get_data_init_lock
-from ..utils import compute_mdhash_id, logger
+from ..utils import logger
+from ..text_utils import compute_mdhash_id
 
 if not pm.is_installed("qdrant-client"):
     pm.install("qdrant-client")

@@ -4,24 +4,31 @@ import asyncio
 import json
 import json_repair
 import time
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, AsyncIterator, overload, Literal
 
 from lightrag.utils import (
     logger,
-    Tokenizer,
-    compute_args_hash,
-    handle_cache,
-    save_to_cache,
-    CacheData,
-    truncate_list_by_token_size,
-    split_string_by_multi_markers,
-    remove_think_tags,
     pick_by_weighted_polling,
     pick_by_vector_similarity,
     process_chunks_unified,
     convert_to_user_format,
     generate_reference_list_from_chunks,
+)
+from lightrag.llm_cache import (
+    handle_cache,
+    save_to_cache,
+    CacheData,
+)
+from lightrag.text_utils import (
+    compute_args_hash,
+    split_string_by_multi_markers,
+    remove_think_tags,
+)
+from lightrag.tokenization import (
+    Tokenizer,
+    truncate_list_by_token_size,
 )
 from lightrag.base import (
     BaseGraphStorage,
@@ -239,6 +246,271 @@ async def _get_vector_context(
         return []
 
 
+@dataclass
+class _KGSearchOutput:
+    """Raw per-mode search output before universal round-robin merge."""
+
+    local_entities: list = field(default_factory=list)
+    local_relations: list = field(default_factory=list)
+    global_entities: list = field(default_factory=list)
+    global_relations: list = field(default_factory=list)
+    vector_chunks: list = field(default_factory=list)
+    chunk_tracking: dict = field(default_factory=dict)
+    query_embedding: Any = None
+
+
+async def _batch_embed(
+    texts_and_purposes: list[tuple[str, str]],
+    embed_func: Any,
+) -> dict[str, Any]:
+    """Batch-embed texts in a single API call; return {purpose: embedding}. Returns {} on failure."""
+    if not texts_and_purposes or not embed_func:
+        return {}
+    texts = [t for t, _ in texts_and_purposes]
+    purposes = [p for _, p in texts_and_purposes]
+    try:
+        embeddings = await embed_func(texts, _priority=5)
+        logger.debug(
+            "Pre-computed %d embeddings in single batch (purposes: %s)",
+            len(texts),
+            ", ".join(purposes),
+        )
+        return {p: embeddings[i] for i, p in enumerate(purposes)}
+    except Exception as e:
+        logger.warning(f"Failed to batch pre-compute embeddings: {e}")
+        return {}
+
+
+def _round_robin_merge_entities(local: list, global_: list) -> list:
+    final: list = []
+    seen: set = set()
+    for i in range(max(len(local), len(global_))):
+        for bucket in (local, global_):
+            if i < len(bucket):
+                entity = bucket[i]
+                name = entity.get("entity_name")
+                if name and name not in seen:
+                    final.append(entity)
+                    seen.add(name)
+    return final
+
+
+def _round_robin_merge_relations(local: list, global_: list) -> list:
+    final: list = []
+    seen: set = set()
+    for i in range(max(len(local), len(global_))):
+        for bucket in (local, global_):
+            if i < len(bucket):
+                rel = bucket[i]
+                key = tuple(
+                    sorted(
+                        rel["src_tgt"]
+                        if "src_tgt" in rel
+                        else [rel.get("src_id"), rel.get("tgt_id")]
+                    )
+                )
+                if key not in seen:
+                    final.append(rel)
+                    seen.add(key)
+    return final
+
+
+async def _kg_search_local(
+    query: str,
+    ll_keywords: str,
+    hl_keywords: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    chunks_vdb: BaseVectorStorage | None,
+) -> _KGSearchOutput:
+    kg_chunk_pick_method = text_chunks_db.global_config.get(
+        "kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD
+    )
+    to_embed: list[tuple[str, str]] = []
+    if query and (kg_chunk_pick_method == "VECTOR" or chunks_vdb):
+        to_embed.append((query, "query"))
+    if ll_keywords:
+        to_embed.append((ll_keywords, "ll"))
+    embs = await _batch_embed(to_embed, text_chunks_db.embedding_func)
+
+    local_entities, local_relations = [], []
+    if ll_keywords:
+        local_entities, local_relations = await _get_node_data(
+            ll_keywords,
+            knowledge_graph_inst,
+            entities_vdb,
+            query_param,
+            query_embedding=embs.get("ll"),
+        )
+    return _KGSearchOutput(
+        local_entities=local_entities,
+        local_relations=local_relations,
+        query_embedding=embs.get("query"),
+    )
+
+
+async def _kg_search_global(
+    query: str,
+    ll_keywords: str,
+    hl_keywords: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    chunks_vdb: BaseVectorStorage | None,
+) -> _KGSearchOutput:
+    kg_chunk_pick_method = text_chunks_db.global_config.get(
+        "kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD
+    )
+    to_embed: list[tuple[str, str]] = []
+    if query and (kg_chunk_pick_method == "VECTOR" or chunks_vdb):
+        to_embed.append((query, "query"))
+    if hl_keywords:
+        to_embed.append((hl_keywords, "hl"))
+    embs = await _batch_embed(to_embed, text_chunks_db.embedding_func)
+
+    global_relations, global_entities = [], []
+    if hl_keywords:
+        global_relations, global_entities = await _get_edge_data(
+            hl_keywords,
+            knowledge_graph_inst,
+            relationships_vdb,
+            query_param,
+            query_embedding=embs.get("hl"),
+        )
+    return _KGSearchOutput(
+        global_entities=global_entities,
+        global_relations=global_relations,
+        query_embedding=embs.get("query"),
+    )
+
+
+async def _kg_search_hybrid(
+    query: str,
+    ll_keywords: str,
+    hl_keywords: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    chunks_vdb: BaseVectorStorage | None,
+) -> _KGSearchOutput:
+    kg_chunk_pick_method = text_chunks_db.global_config.get(
+        "kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD
+    )
+    to_embed: list[tuple[str, str]] = []
+    if query and (kg_chunk_pick_method == "VECTOR" or chunks_vdb):
+        to_embed.append((query, "query"))
+    if ll_keywords:
+        to_embed.append((ll_keywords, "ll"))
+    if hl_keywords:
+        to_embed.append((hl_keywords, "hl"))
+    embs = await _batch_embed(to_embed, text_chunks_db.embedding_func)
+
+    local_entities, local_relations = [], []
+    if ll_keywords:
+        local_entities, local_relations = await _get_node_data(
+            ll_keywords,
+            knowledge_graph_inst,
+            entities_vdb,
+            query_param,
+            query_embedding=embs.get("ll"),
+        )
+    global_relations, global_entities = [], []
+    if hl_keywords:
+        global_relations, global_entities = await _get_edge_data(
+            hl_keywords,
+            knowledge_graph_inst,
+            relationships_vdb,
+            query_param,
+            query_embedding=embs.get("hl"),
+        )
+    return _KGSearchOutput(
+        local_entities=local_entities,
+        local_relations=local_relations,
+        global_entities=global_entities,
+        global_relations=global_relations,
+        query_embedding=embs.get("query"),
+    )
+
+
+async def _kg_search_mix(
+    query: str,
+    ll_keywords: str,
+    hl_keywords: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    chunks_vdb: BaseVectorStorage | None,
+) -> _KGSearchOutput:
+    kg_chunk_pick_method = text_chunks_db.global_config.get(
+        "kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD
+    )
+    to_embed: list[tuple[str, str]] = []
+    if query and (kg_chunk_pick_method == "VECTOR" or chunks_vdb):
+        to_embed.append((query, "query"))
+    if ll_keywords:
+        to_embed.append((ll_keywords, "ll"))
+    if hl_keywords:
+        to_embed.append((hl_keywords, "hl"))
+    embs = await _batch_embed(to_embed, text_chunks_db.embedding_func)
+
+    local_entities, local_relations = [], []
+    if ll_keywords:
+        local_entities, local_relations = await _get_node_data(
+            ll_keywords,
+            knowledge_graph_inst,
+            entities_vdb,
+            query_param,
+            query_embedding=embs.get("ll"),
+        )
+    global_relations, global_entities = [], []
+    if hl_keywords:
+        global_relations, global_entities = await _get_edge_data(
+            hl_keywords,
+            knowledge_graph_inst,
+            relationships_vdb,
+            query_param,
+            query_embedding=embs.get("hl"),
+        )
+    vector_chunks: list = []
+    chunk_tracking: dict = {}
+    if chunks_vdb:
+        vector_chunks = await _get_vector_context(
+            query, chunks_vdb, query_param, embs.get("query")
+        )
+        for i, chunk in enumerate(vector_chunks):
+            chunk_id = chunk.get("chunk_id") or chunk.get("id")
+            if chunk_id:
+                chunk_tracking[chunk_id] = {"source": "C", "frequency": 1, "order": i + 1}
+            else:
+                logger.warning(f"Vector chunk missing chunk_id: {chunk}")
+    return _KGSearchOutput(
+        local_entities=local_entities,
+        local_relations=local_relations,
+        global_entities=global_entities,
+        global_relations=global_relations,
+        vector_chunks=vector_chunks,
+        chunk_tracking=chunk_tracking,
+        query_embedding=embs.get("query"),
+    )
+
+
+_KG_SEARCH_FN: dict[str, Any] = {
+    "local": _kg_search_local,
+    "global": _kg_search_global,
+    "hybrid": _kg_search_hybrid,
+    "mix": _kg_search_mix,
+}
+
+
 async def _perform_kg_search(
     query: str,
     ll_keywords: str,
@@ -250,202 +522,30 @@ async def _perform_kg_search(
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
 ) -> dict[str, Any]:
-    """
-    Pure search logic that retrieves raw entities, relations, and vector chunks.
-    No token truncation or formatting - just raw search results.
-    """
+    """Route to mode-specific search, then apply universal round-robin merge."""
+    search_fn = _KG_SEARCH_FN.get(query_param.mode)
+    if search_fn is None:
+        raise ValueError(f"Unsupported query mode: {query_param.mode!r}")
 
-    # Initialize result containers
-    local_entities = []
-    local_relations = []
-    global_entities = []
-    global_relations = []
-    vector_chunks = []
-    chunk_tracking = {}
-
-    # Handle different query modes
-
-    # Track chunk sources and metadata for final logging
-    chunk_tracking = {}  # chunk_id -> {source, frequency, order}
-
-    # Pre-compute embeddings needed by the selected mode in a single batch call.
-    # Only embed texts that the active retrieval branches will actually use:
-    #   - query        → used by _get_vector_context (chunks VDB)
-    #   - ll_keywords  → used by _get_node_data (entities VDB) in local/hybrid/mix
-    #   - hl_keywords  → used by _get_edge_data (relationships VDB) in global/hybrid/mix
-    # Batching avoids 2-3 sequential API round-trips.
-    kg_chunk_pick_method = text_chunks_db.global_config.get(
-        "kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD
+    raw = await search_fn(
+        query, ll_keywords, hl_keywords,
+        knowledge_graph_inst, entities_vdb, relationships_vdb,
+        text_chunks_db, query_param, chunks_vdb,
     )
 
-    actual_embedding_func = text_chunks_db.embedding_func
-    query_embedding = None
-    ll_embedding = None
-    hl_embedding = None
-
-    mode = query_param.mode
-    need_ll = mode in ("local", "hybrid", "mix") and bool(ll_keywords)
-    need_hl = mode in ("global", "hybrid", "mix") and bool(hl_keywords)
-
-    if actual_embedding_func:
-        texts_to_embed: list[str] = []
-        text_purposes: list[str] = []
-
-        if query and (kg_chunk_pick_method == "VECTOR" or chunks_vdb):
-            texts_to_embed.append(query)
-            text_purposes.append("query")
-
-        if need_ll:
-            texts_to_embed.append(ll_keywords)
-            text_purposes.append("ll")
-
-        if need_hl:
-            texts_to_embed.append(hl_keywords)
-            text_purposes.append("hl")
-
-        if texts_to_embed:
-            try:
-                all_embeddings = await actual_embedding_func(
-                    texts_to_embed, _priority=5
-                )
-                for i, purpose in enumerate(text_purposes):
-                    if purpose == "query":
-                        query_embedding = all_embeddings[i]
-                    elif purpose == "ll":
-                        ll_embedding = all_embeddings[i]
-                    elif purpose == "hl":
-                        hl_embedding = all_embeddings[i]
-                logger.debug(
-                    "Pre-computed %d embeddings in single batch (purposes: %s)",
-                    len(texts_to_embed),
-                    ", ".join(text_purposes),
-                )
-            except Exception as e:
-                logger.warning(f"Failed to batch pre-compute embeddings: {e}")
-
-    # Handle local and global modes
-    if query_param.mode == "local" and len(ll_keywords) > 0:
-        local_entities, local_relations = await _get_node_data(
-            ll_keywords,
-            knowledge_graph_inst,
-            entities_vdb,
-            query_param,
-            query_embedding=ll_embedding,
-        )
-
-    elif query_param.mode == "global" and len(hl_keywords) > 0:
-        global_relations, global_entities = await _get_edge_data(
-            hl_keywords,
-            knowledge_graph_inst,
-            relationships_vdb,
-            query_param,
-            query_embedding=hl_embedding,
-        )
-
-    else:  # hybrid or mix mode
-        if len(ll_keywords) > 0:
-            local_entities, local_relations = await _get_node_data(
-                ll_keywords,
-                knowledge_graph_inst,
-                entities_vdb,
-                query_param,
-                query_embedding=ll_embedding,
-            )
-        if len(hl_keywords) > 0:
-            global_relations, global_entities = await _get_edge_data(
-                hl_keywords,
-                knowledge_graph_inst,
-                relationships_vdb,
-                query_param,
-                query_embedding=hl_embedding,
-            )
-
-        # Get vector chunks for mix mode
-        if query_param.mode == "mix" and chunks_vdb:
-            vector_chunks = await _get_vector_context(
-                query,
-                chunks_vdb,
-                query_param,
-                query_embedding,
-            )
-            # Track vector chunks with source metadata
-            for i, chunk in enumerate(vector_chunks):
-                chunk_id = chunk.get("chunk_id") or chunk.get("id")
-                if chunk_id:
-                    chunk_tracking[chunk_id] = {
-                        "source": "C",
-                        "frequency": 1,  # Vector chunks always have frequency 1
-                        "order": i + 1,  # 1-based order in vector search results
-                    }
-                else:
-                    logger.warning(f"Vector chunk missing chunk_id: {chunk}")
-
-    # Round-robin merge entities
-    final_entities = []
-    seen_entities = set()
-    max_len = max(len(local_entities), len(global_entities))
-    for i in range(max_len):
-        # First from local
-        if i < len(local_entities):
-            entity = local_entities[i]
-            entity_name = entity.get("entity_name")
-            if entity_name and entity_name not in seen_entities:
-                final_entities.append(entity)
-                seen_entities.add(entity_name)
-
-        # Then from global
-        if i < len(global_entities):
-            entity = global_entities[i]
-            entity_name = entity.get("entity_name")
-            if entity_name and entity_name not in seen_entities:
-                final_entities.append(entity)
-                seen_entities.add(entity_name)
-
-    # Round-robin merge relations
-    final_relations = []
-    seen_relations = set()
-    max_len = max(len(local_relations), len(global_relations))
-    for i in range(max_len):
-        # First from local
-        if i < len(local_relations):
-            relation = local_relations[i]
-            # Build relation unique identifier
-            if "src_tgt" in relation:
-                rel_key = tuple(sorted(relation["src_tgt"]))
-            else:
-                rel_key = tuple(
-                    sorted([relation.get("src_id"), relation.get("tgt_id")])
-                )
-
-            if rel_key not in seen_relations:
-                final_relations.append(relation)
-                seen_relations.add(rel_key)
-
-        # Then from global
-        if i < len(global_relations):
-            relation = global_relations[i]
-            # Build relation unique identifier
-            if "src_tgt" in relation:
-                rel_key = tuple(sorted(relation["src_tgt"]))
-            else:
-                rel_key = tuple(
-                    sorted([relation.get("src_id"), relation.get("tgt_id")])
-                )
-
-            if rel_key not in seen_relations:
-                final_relations.append(relation)
-                seen_relations.add(rel_key)
+    final_entities = _round_robin_merge_entities(raw.local_entities, raw.global_entities)
+    final_relations = _round_robin_merge_relations(raw.local_relations, raw.global_relations)
 
     logger.info(
-        f"Raw search results: {len(final_entities)} entities, {len(final_relations)} relations, {len(vector_chunks)} vector chunks"
+        f"Raw search results: {len(final_entities)} entities, {len(final_relations)} relations, {len(raw.vector_chunks)} vector chunks"
     )
 
     return {
         "final_entities": final_entities,
         "final_relations": final_relations,
-        "vector_chunks": vector_chunks,
-        "chunk_tracking": chunk_tracking,
-        "query_embedding": query_embedding,
+        "vector_chunks": raw.vector_chunks,
+        "chunk_tracking": raw.chunk_tracking,
+        "query_embedding": raw.query_embedding,
     }
 
 
@@ -902,7 +1002,6 @@ async def _build_context_str(
     return result, final_data
 
 
-# Now let's update the old _build_query_context to use the new architecture
 async def _build_query_context(
     query: str,
     ll_keywords: str,
@@ -940,11 +1039,8 @@ async def _build_query_context(
     )
 
     if not search_result["final_entities"] and not search_result["final_relations"]:
-        if query_param.mode != "mix":
+        if not search_result["chunk_tracking"]:
             return None
-        else:
-            if not search_result["chunk_tracking"]:
-                return None
 
     # Stage 2: Apply token truncation for LLM efficiency
     truncation_result = await _apply_token_truncation(

@@ -13,10 +13,13 @@ from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.lightrag import LightRAG
 from lightrag.utils import (
     EmbeddingFunc,
-    Tokenizer,
+    CancellationToken,
+)
+from lightrag.text_utils import (
     compute_mdhash_id,
     make_relation_chunk_key,
 )
+from lightrag.tokenization import Tokenizer
 
 pytestmark = pytest.mark.offline
 
@@ -322,7 +325,7 @@ async def test_extract_failure_preserves_chunks_and_allows_delete_with_cache_cle
         doc_id = compute_mdhash_id(content, prefix="doc-")
         await rag.apipeline_enqueue_documents(input=content, file_paths=file_path)
 
-        async def fail_extract(self, chunks, pipeline_status, pipeline_status_lock):
+        async def fail_extract(self, chunks, token=None):
             raise RuntimeError("extract fail sentinel")
 
         rag._process_extract_entities = MethodType(fail_extract, rag)
@@ -408,7 +411,7 @@ async def test_merge_failure_preserves_chunks_and_skip_cache_cleanup_when_disabl
         doc_id = compute_mdhash_id(content, prefix="doc-")
         await rag.apipeline_enqueue_documents(input=content, file_paths=file_path)
 
-        async def ok_extract(self, chunks, pipeline_status, pipeline_status_lock):
+        async def ok_extract(self, chunks, token=None):
             return {"chunk_count": len(chunks)}
 
         async def fail_merge(**kwargs):
@@ -1083,11 +1086,11 @@ async def test_validate_and_fix_consistency_preserves_chunks_on_reset(tmp_path):
         processing_docs = await rag.doc_status.get_docs_by_status(DocStatus.PROCESSING)
         to_process_docs = {**failed_docs, **processing_docs}
 
-        pipeline_status = {"latest_message": "", "history_messages": []}
+        _ps = {"latest_message": "", "history_messages": []}
+        _token = CancellationToken(_ps, asyncio.Lock())
         await rag._validate_and_fix_document_consistency(
             to_process_docs=to_process_docs,
-            pipeline_status=pipeline_status,
-            pipeline_status_lock=asyncio.Lock(),
+            token=_token,
         )
 
         failed_reset = await rag.doc_status.get_by_id(failed_doc_id)
@@ -1146,11 +1149,11 @@ async def test_validate_and_fix_consistency_repairs_unknown_file_path_from_full_
         )
 
         failed_docs = await rag.doc_status.get_docs_by_status(DocStatus.FAILED)
-        pipeline_status = {"latest_message": "", "history_messages": []}
+        _ps = {"latest_message": "", "history_messages": []}
+        _token = CancellationToken(_ps, asyncio.Lock())
         await rag._validate_and_fix_document_consistency(
             to_process_docs=failed_docs,
-            pipeline_status=pipeline_status,
-            pipeline_status_lock=asyncio.Lock(),
+            token=_token,
         )
 
         repaired_status = await rag.doc_status.get_by_id(doc_id)
@@ -1179,9 +1182,7 @@ async def test_pipeline_cancellation_preserves_file_path_for_queued_docs(
         extraction_started = asyncio.Event()
         release_first_doc = asyncio.Event()
 
-        async def _blocking_extract(
-            self, chunks, pipeline_status, pipeline_status_lock
-        ):
+        async def _blocking_extract(self, chunks, token=None):
             extraction_started.set()
             await release_first_doc.wait()
             return []
@@ -1241,9 +1242,7 @@ async def test_pipeline_cancellation_repairs_placeholder_file_path_for_queued_do
         extraction_started = asyncio.Event()
         release_first_doc = asyncio.Event()
 
-        async def _blocking_extract(
-            self, chunks, pipeline_status, pipeline_status_lock
-        ):
+        async def _blocking_extract(self, chunks, token=None):
             extraction_started.set()
             await release_first_doc.wait()
             return []

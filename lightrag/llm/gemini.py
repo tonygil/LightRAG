@@ -24,9 +24,11 @@ from tenacity import (
 
 from lightrag.utils import (
     logger,
+    wrap_embedding_func_with_attrs,
+)
+from lightrag.text_utils import (
     remove_think_tags,
     safe_unicode_decode,
-    wrap_embedding_func_with_attrs,
 )
 
 import pipmaster as pm

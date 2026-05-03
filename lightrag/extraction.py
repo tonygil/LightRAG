@@ -8,17 +8,22 @@ from typing import Any
 
 from lightrag.utils import (
     logger,
-    Tokenizer,
+    create_prefixed_exception,
+    _cooperative_yield,
+    CancellationToken,
+)
+from lightrag.llm_cache import (
+    use_llm_func_with_cache,
+    update_chunk_cache_list,
+)
+from lightrag.text_utils import (
     sanitize_and_normalize_extracted_text,
     is_float_regex,
     pack_user_ass_to_openai_messages,
     split_string_by_multi_markers,
-    use_llm_func_with_cache,
-    update_chunk_cache_list,
     fix_tuple_delimiter_corruption,
-    create_prefixed_exception,
-    _cooperative_yield,
 )
+from lightrag.tokenization import Tokenizer
 from lightrag.base import (
     BaseKVStorage,
     TextChunkSchema,
@@ -433,18 +438,13 @@ async def _process_extraction_result(
 async def extract_entities(
     chunks: dict[str, TextChunkSchema],
     config: PipelineConfig,
-    pipeline_status: dict = None,
-    pipeline_status_lock=None,
+    token: CancellationToken | None = None,
     llm_response_cache: BaseKVStorage | None = None,
     text_chunks_storage: BaseKVStorage | None = None,
 ) -> list:
     # Check for cancellation at the start of entity extraction
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            if pipeline_status.get("cancellation_requested", False):
-                raise PipelineCancelledException(
-                    "User cancelled during entity extraction"
-                )
+    if token is not None:
+        await token.raise_if_cancelled()
 
     use_llm_func: callable = config.llm_model_func
     entity_extract_max_gleaning = config.entity_extract_max_gleaning
@@ -629,10 +629,8 @@ async def extract_entities(
         relations_count = len(maybe_edges)
         log_message = f"Chunk {processed_chunks} of {total_chunks} extracted {entities_count} Ent + {relations_count} Rel {chunk_key}"
         logger.info(log_message)
-        if pipeline_status is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = log_message
-                pipeline_status["history_messages"].append(log_message)
+        if token is not None:
+            await token.post_status(log_message)
 
         # Return the extracted nodes and edges for centralized processing
         return maybe_nodes, maybe_edges
@@ -644,12 +642,8 @@ async def extract_entities(
     async def _process_with_semaphore(chunk):
         async with semaphore:
             # Check for cancellation before processing chunk
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    if pipeline_status.get("cancellation_requested", False):
-                        raise PipelineCancelledException(
-                            "User cancelled during chunk processing"
-                        )
+            if token is not None:
+                await token.raise_if_cancelled()
 
             try:
                 result = await _process_single_content(chunk)

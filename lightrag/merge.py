@@ -6,15 +6,18 @@ from collections import Counter, defaultdict
 
 from lightrag.utils import (
     logger,
+    safe_vdb_operation_with_exception,
+    create_prefixed_exception,
+    _cooperative_yield,
+    performance_timing_log,
+    CancellationToken,
+)
+from lightrag.text_utils import (
     compute_mdhash_id,
     split_string_by_multi_markers,
     apply_source_ids_limit,
     merge_source_ids,
     make_relation_chunk_key,
-    safe_vdb_operation_with_exception,
-    create_prefixed_exception,
-    _cooperative_yield,
-    performance_timing_log,
 )
 from lightrag.base import (
     BaseGraphStorage,
@@ -47,8 +50,7 @@ async def rebuild_knowledge_from_chunks(
     text_chunks_storage: BaseKVStorage,
     llm_response_cache: BaseKVStorage,
     config: PipelineConfig,
-    pipeline_status: dict | None = None,
-    pipeline_status_lock=None,
+    token: CancellationToken | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
     relation_chunks_storage: BaseKVStorage | None = None,
 ) -> None:
@@ -66,9 +68,8 @@ async def rebuild_knowledge_from_chunks(
         relationships_vdb: Relationship vector database
         text_chunks_storage: Text chunks storage
         llm_response_cache: LLM response cache
-        global_config: Global configuration containing llm_model_max_async
-        pipeline_status: Pipeline status dictionary
-        pipeline_status_lock: Lock for pipeline status
+        config: Pipeline configuration containing llm_model_max_async
+        token: Cancellation token for cooperative cancellation and status reporting
         entity_chunks_storage: KV storage maintaining full chunk IDs per entity
         relation_chunks_storage: KV storage maintaining full chunk IDs per relation
     """
@@ -84,10 +85,8 @@ async def rebuild_knowledge_from_chunks(
 
     status_message = f"Rebuilding knowledge from {len(all_referenced_chunk_ids)} cached chunk extractions (parallel processing)"
     logger.info(status_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
+    if token is not None:
+        await token.post_status(status_message)
 
     # Get cached extraction results for these chunks using storage
     # cached_results： chunk_id -> [list of (extraction_result, create_time) from LLM cache sorted by create_time of the first extraction_result]
@@ -100,10 +99,8 @@ async def rebuild_knowledge_from_chunks(
     if not cached_results:
         status_message = "No cached extraction results found, cannot rebuild"
         logger.warning(status_message)
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = status_message
-                pipeline_status["history_messages"].append(status_message)
+        if token is not None:
+            await token.post_status(status_message)
         return
 
     # Process cached results to get entities and relationships for each chunk
@@ -177,10 +174,8 @@ async def rebuild_knowledge_from_chunks(
                 f"Failed to parse cached extraction result for chunk {chunk_id}: {e}"
             )
             logger.info(status_message)  # Per requirement, change to info
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = status_message
-                    pipeline_status["history_messages"].append(status_message)
+            if token is not None:
+                await token.post_status(status_message)
             continue
 
     # Get max async tasks limit from config for semaphore control
@@ -217,10 +212,8 @@ async def rebuild_knowledge_from_chunks(
                     failed_entities_count += 1
                     status_message = f"Failed to rebuild `{entity_name}`: {e}"
                     logger.info(status_message)  # Per requirement, change to info
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status["latest_message"] = status_message
-                            pipeline_status["history_messages"].append(status_message)
+                    if token is not None:
+                        await token.post_status(status_message)
 
     async def _locked_rebuild_relationship(src, tgt, chunk_ids):
         nonlocal rebuilt_relationships_count, failed_relationships_count
@@ -247,18 +240,15 @@ async def rebuild_knowledge_from_chunks(
                         config=config,
                         relation_chunks_storage=relation_chunks_storage,
                         entity_chunks_storage=entity_chunks_storage,
-                        pipeline_status=pipeline_status,
-                        pipeline_status_lock=pipeline_status_lock,
+                        token=token,
                     )
                     rebuilt_relationships_count += 1
                 except Exception as e:
                     failed_relationships_count += 1
                     status_message = f"Failed to rebuild `{src}`~`{tgt}`: {e}"
                     logger.info(status_message)  # Per requirement, change to info
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status["latest_message"] = status_message
-                            pipeline_status["history_messages"].append(status_message)
+                    if token is not None:
+                        await token.post_status(status_message)
 
     # Create tasks for parallel processing
     tasks = []
@@ -276,10 +266,8 @@ async def rebuild_knowledge_from_chunks(
     # Log parallel processing start
     status_message = f"Starting parallel rebuild of {len(entities_to_rebuild)} entities and {len(relationships_to_rebuild)} relationships (async: {graph_max_async})"
     logger.info(status_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
+    if token is not None:
+        await token.post_status(status_message)
 
     # Execute all tasks in parallel with semaphore control and early failure detection
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -319,10 +307,8 @@ async def rebuild_knowledge_from_chunks(
         status_message += f" Failed: {failed_entities_count} entities, {failed_relationships_count} relationships."
 
     logger.info(status_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
+    if token is not None:
+        await token.post_status(status_message)
 
 
 async def _get_cached_extraction_results(
@@ -460,8 +446,7 @@ async def _rebuild_single_entity(
     llm_response_cache: BaseKVStorage,
     config: PipelineConfig,
     entity_chunks_storage: BaseKVStorage | None = None,
-    pipeline_status: dict | None = None,
-    pipeline_status_lock=None,
+    token: CancellationToken | None = None,
 ) -> None:
     """Rebuild a single entity from cached extraction results"""
 
@@ -685,11 +670,8 @@ async def _rebuild_single_entity(
     if truncation_info:
         status_message += f" ({truncation_info})"
     logger.info(status_message)
-    # Update pipeline status
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
+    if token is not None:
+        await token.post_status(status_message)
 
 
 async def _rebuild_single_relationship(
@@ -704,8 +686,7 @@ async def _rebuild_single_relationship(
     config: PipelineConfig,
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
-    pipeline_status: dict | None = None,
-    pipeline_status_lock=None,
+    token: CancellationToken | None = None,
 ) -> None:
     """Rebuild a single relationship from cached extraction results
 
@@ -961,12 +942,8 @@ async def _rebuild_single_relationship(
         status_message += truncation_info
 
     logger.info(status_message)
-
-    # Update pipeline status
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
+    if token is not None:
+        await token.post_status(status_message)
 
 
 async def _merge_nodes_then_upsert(
@@ -975,8 +952,7 @@ async def _merge_nodes_then_upsert(
     knowledge_graph_inst: BaseGraphStorage,
     entity_vdb: BaseVectorStorage | None,
     config: PipelineConfig,
-    pipeline_status: dict = None,
-    pipeline_status_lock=None,
+    token: CancellationToken | None = None,
     llm_response_cache: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
 ):
@@ -1137,12 +1113,8 @@ async def _merge_nodes_then_upsert(
             description_list = [fallback_description]
 
         # Check for cancellation before LLM summary
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                if pipeline_status.get("cancellation_requested", False):
-                    raise PipelineCancelledException(
-                        "User cancelled during entity summary"
-                    )
+        if token is not None:
+            await token.raise_if_cancelled()
 
         # 8. Get summary description an LLM usage status
         description, llm_was_used = await _handle_entity_relation_summary(
@@ -1234,13 +1206,11 @@ async def _merge_nodes_then_upsert(
                 f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
             )
 
-        # Add message to pipeline satus when merge happens
+        # Add message to pipeline status when merge happens
         if already_fragment > 0 or llm_was_used:
             logger.info(status_message)
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = status_message
-                    pipeline_status["history_messages"].append(status_message)
+            if token is not None:
+                await token.post_status(status_message)
         else:
             logger.debug(status_message)
 
@@ -1295,8 +1265,7 @@ async def _merge_edges_then_upsert(
     relationships_vdb: BaseVectorStorage | None,
     entity_vdb: BaseVectorStorage | None,
     config: PipelineConfig,
-    pipeline_status: dict = None,
-    pipeline_status_lock=None,
+    token: CancellationToken | None = None,
     llm_response_cache: BaseKVStorage | None = None,
     added_entities: list = None,  # New parameter to track entities added during edge processing
     relation_chunks_storage: BaseKVStorage | None = None,
@@ -1480,12 +1449,8 @@ async def _merge_edges_then_upsert(
             raise ValueError(f"Relation {src_id}~{tgt_id} has no description")
 
         # Check for cancellation before LLM summary
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                if pipeline_status.get("cancellation_requested", False):
-                    raise PipelineCancelledException(
-                        "User cancelled during relation summary"
-                    )
+        if token is not None:
+            await token.raise_if_cancelled()
 
         # 8. Get summary description an LLM usage status
         description, llm_was_used = await _handle_entity_relation_summary(
@@ -1579,13 +1544,11 @@ async def _merge_edges_then_upsert(
                 f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
             )
 
-        # Add message to pipeline satus when merge happens
+        # Add message to pipeline status when merge happens
         if already_fragment > 0 or llm_was_used:
             logger.info(status_message)
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = status_message
-                    pipeline_status["history_messages"].append(status_message)
+            if token is not None:
+                await token.post_status(status_message)
         else:
             logger.debug(status_message)
 
@@ -1759,10 +1722,8 @@ async def _merge_edges_then_upsert(
                         f"Chunks appended from relation: `{need_insert_id}`"
                     )
                     logger.info(status_message)
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status["latest_message"] = status_message
-                            pipeline_status["history_messages"].append(status_message)
+                    if token is not None:
+                        await token.post_status(status_message)
 
         edge_created_at = int(time.time())
         await knowledge_graph_inst.upsert_edge(
@@ -1843,8 +1804,7 @@ async def merge_nodes_and_edges(
     full_entities_storage: BaseKVStorage = None,
     full_relations_storage: BaseKVStorage = None,
     doc_id: str = None,
-    pipeline_status: dict = None,
-    pipeline_status_lock=None,
+    token: CancellationToken | None = None,
     llm_response_cache: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
     relation_chunks_storage: BaseKVStorage | None = None,
@@ -1864,12 +1824,11 @@ async def merge_nodes_and_edges(
         knowledge_graph_inst: Knowledge graph storage
         entity_vdb: Entity vector database
         relationships_vdb: Relationship vector database
-        global_config: Global configuration
+        config: Pipeline configuration
         full_entities_storage: Storage for document entity lists
         full_relations_storage: Storage for document relation lists
         doc_id: Document ID for storage indexing
-        pipeline_status: Pipeline status dictionary
-        pipeline_status_lock: Lock for pipeline status
+        token: Cancellation token for cooperative cancellation and status reporting
         llm_response_cache: LLM response cache
         entity_chunks_storage: Storage tracking full chunk lists per entity
         relation_chunks_storage: Storage tracking full chunk lists per relation
@@ -1879,10 +1838,8 @@ async def merge_nodes_and_edges(
     """
 
     # Check for cancellation at the start of merge
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            if pipeline_status.get("cancellation_requested", False):
-                raise PipelineCancelledException("User cancelled during merge phase")
+    if token is not None:
+        await token.raise_if_cancelled()
 
     # Collect all nodes and edges from all chunks
     all_nodes = defaultdict(list)
@@ -1904,9 +1861,8 @@ async def merge_nodes_and_edges(
 
     log_message = f"Merging stage {current_file_number}/{total_files}: {file_path}"
     logger.info(log_message)
-    async with pipeline_status_lock:
-        pipeline_status["latest_message"] = log_message
-        pipeline_status["history_messages"].append(log_message)
+    if token is not None:
+        await token.post_status(log_message)
 
     # Get max async tasks limit from global_config for semaphore control
     graph_max_async = config.llm_model_max_async * 2
@@ -1915,19 +1871,14 @@ async def merge_nodes_and_edges(
     # ===== Phase 1: Process all entities concurrently =====
     log_message = f"Phase 1: Processing {total_entities_count} entities from {doc_id} (async: {graph_max_async})"
     logger.info(log_message)
-    async with pipeline_status_lock:
-        pipeline_status["latest_message"] = log_message
-        pipeline_status["history_messages"].append(log_message)
+    if token is not None:
+        await token.post_status(log_message)
 
     async def _locked_process_entity_name(entity_name, entities):
         async with semaphore:
             # Check for cancellation before processing entity
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    if pipeline_status.get("cancellation_requested", False):
-                        raise PipelineCancelledException(
-                            "User cancelled during entity merge"
-                        )
+            if token is not None:
+                await token.raise_if_cancelled()
 
             workspace = config.workspace
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
@@ -1942,8 +1893,7 @@ async def merge_nodes_and_edges(
                         knowledge_graph_inst,
                         entity_vdb,
                         config,
-                        pipeline_status,
-                        pipeline_status_lock,
+                        token,
                         llm_response_cache,
                         entity_chunks_storage,
                     )
@@ -1954,15 +1904,9 @@ async def merge_nodes_and_edges(
                     error_msg = f"Error processing entity `{entity_name}`: {e}"
                     logger.error(error_msg)
 
-                    # Try to update pipeline status, but don't let status update failure affect main exception
                     try:
-                        if (
-                            pipeline_status is not None
-                            and pipeline_status_lock is not None
-                        ):
-                            async with pipeline_status_lock:
-                                pipeline_status["latest_message"] = error_msg
-                                pipeline_status["history_messages"].append(error_msg)
+                        if token is not None:
+                            await token.post_status(error_msg)
                     except Exception as status_error:
                         logger.error(
                             f"Failed to update pipeline status: {status_error}"
@@ -2020,19 +1964,14 @@ async def merge_nodes_and_edges(
     # ===== Phase 2: Process all relationships concurrently =====
     log_message = f"Phase 2: Processing {total_relations_count} relations from {doc_id} (async: {graph_max_async})"
     logger.info(log_message)
-    async with pipeline_status_lock:
-        pipeline_status["latest_message"] = log_message
-        pipeline_status["history_messages"].append(log_message)
+    if token is not None:
+        await token.post_status(log_message)
 
     async def _locked_process_edges(edge_key, edges):
         async with semaphore:
             # Check for cancellation before processing edges
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    if pipeline_status.get("cancellation_requested", False):
-                        raise PipelineCancelledException(
-                            "User cancelled during relation merge"
-                        )
+            if token is not None:
+                await token.raise_if_cancelled()
 
             workspace = config.workspace
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
@@ -2055,12 +1994,11 @@ async def merge_nodes_and_edges(
                         relationships_vdb,
                         entity_vdb,
                         config,
-                        pipeline_status,
-                        pipeline_status_lock,
+                        token,
                         llm_response_cache,
                         added_entities,  # Pass list to collect added entities
                         relation_chunks_storage,
-                        entity_chunks_storage,  # Add entity_chunks_storage parameter
+                        entity_chunks_storage,
                     )
 
                     if edge_data is None:
@@ -2072,15 +2010,9 @@ async def merge_nodes_and_edges(
                     error_msg = f"Error processing relation `{sorted_edge_key}`: {e}"
                     logger.error(error_msg)
 
-                    # Try to update pipeline status, but don't let status update failure affect main exception
                     try:
-                        if (
-                            pipeline_status is not None
-                            and pipeline_status_lock is not None
-                        ):
-                            async with pipeline_status_lock:
-                                pipeline_status["latest_message"] = error_msg
-                                pipeline_status["history_messages"].append(error_msg)
+                        if token is not None:
+                            await token.post_status(error_msg)
                     except Exception as status_error:
                         logger.error(
                             f"Failed to update pipeline status: {status_error}"
@@ -2172,9 +2104,8 @@ async def merge_nodes_and_edges(
 
             log_message = f"Phase 3: Updating final {len(final_entity_names)}({len(processed_entities)}+{len(all_added_entities)}) entities and  {len(final_relation_pairs)} relations from {doc_id}"
             logger.info(log_message)
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = log_message
-                pipeline_status["history_messages"].append(log_message)
+            if token is not None:
+                await token.post_status(log_message)
 
             # Update storage
             if final_entity_names:
@@ -2211,6 +2142,5 @@ async def merge_nodes_and_edges(
 
     log_message = f"Completed merging: {len(processed_entities)} entities, {len(all_added_entities)} extra entities, {len(processed_edges)} relations"
     logger.info(log_message)
-    async with pipeline_status_lock:
-        pipeline_status["latest_message"] = log_message
-        pipeline_status["history_messages"].append(log_message)
+    if token is not None:
+        await token.post_status(log_message)

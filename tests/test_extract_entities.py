@@ -5,7 +5,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from lightrag.config import PipelineConfig
-from lightrag.utils import Tokenizer, TokenizerInterface
+from lightrag.tokenization import (
+    Tokenizer,
+    TokenizerInterface,
+)
 
 
 class DummyTokenizer(TokenizerInterface):
@@ -60,7 +63,7 @@ def _make_chunks(content: str = "Test content.") -> dict[str, dict]:
 @pytest.mark.asyncio
 async def test_gleaning_skipped_when_tokens_exceed_limit():
     """Gleaning should be skipped when estimated tokens exceed max_extract_input_tokens."""
-    from lightrag.operate import extract_entities
+    from lightrag.extraction import extract_entities
 
     config = _make_config(max_extract_input_tokens=10, entity_extract_max_gleaning=1)
     config.llm_model_func.return_value = _EXTRACTION_RESULT
@@ -81,7 +84,7 @@ async def test_gleaning_skipped_when_tokens_exceed_limit():
 @pytest.mark.asyncio
 async def test_gleaning_proceeds_when_tokens_within_limit():
     """Gleaning should proceed when estimated tokens are within max_extract_input_tokens."""
-    from lightrag.operate import extract_entities
+    from lightrag.extraction import extract_entities
 
     config = _make_config(max_extract_input_tokens=999999, entity_extract_max_gleaning=1)
     config.llm_model_func.return_value = _EXTRACTION_RESULT
@@ -97,7 +100,7 @@ async def test_gleaning_proceeds_when_tokens_within_limit():
 @pytest.mark.asyncio
 async def test_no_gleaning_when_max_gleaning_zero():
     """No gleaning when entity_extract_max_gleaning is 0, regardless of token limit."""
-    from lightrag.operate import extract_entities
+    from lightrag.extraction import extract_entities
 
     config = _make_config(max_extract_input_tokens=999999, entity_extract_max_gleaning=0)
     config.llm_model_func.return_value = _EXTRACTION_RESULT

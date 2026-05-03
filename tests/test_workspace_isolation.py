@@ -1011,7 +1011,8 @@ relation<|#|>Deep Learning<|#|>Neural Networks<|#|>uses, composed of<|#|>Deep Le
         print("\nTest 11.1: Create two LightRAG instances with different workspaces")
 
         from lightrag import LightRAG
-        from lightrag.utils import EmbeddingFunc, Tokenizer
+        from lightrag.utils import EmbeddingFunc
+        from lightrag.tokenization import Tokenizer
 
         # Create different mock LLM functions for each workspace
         mock_llm_func_a = create_mock_llm_func("project_a")

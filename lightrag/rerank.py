@@ -52,7 +52,7 @@ def chunk_documents_for_rerank(
         )
 
     try:
-        from .utils import TiktokenTokenizer
+        from .tokenization import TiktokenTokenizer
 
         tokenizer = TiktokenTokenizer(model_name=tokenizer_model)
     except Exception as e:
