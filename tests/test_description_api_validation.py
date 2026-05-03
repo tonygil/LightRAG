@@ -1,5 +1,6 @@
 import pytest
 
+from lightrag.config import PipelineConfig
 from lightrag.constants import SOURCE_IDS_LIMIT_METHOD_KEEP
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.operate import (
@@ -123,17 +124,26 @@ class DummyMergeGraphStorage:
 @pytest.mark.asyncio
 async def test_merge_nodes_then_upsert_handles_missing_legacy_description():
     graph = DummyGraphStorage(node={"source_id": "chunk-1"})
-    global_config = {
-        "source_ids_limit_method": SOURCE_IDS_LIMIT_METHOD_KEEP,
-        "max_source_ids_per_entity": 20,
-    }
+    config = PipelineConfig(
+        llm_model_func=None,
+        tokenizer=None,
+        entity_extract_max_gleaning=1,
+        max_extract_input_tokens=20480,
+        summary_context_size=12000,
+        summary_max_tokens=1200,
+        summary_length_recommended=600,
+        force_llm_summary_on_merge=8,
+        max_source_ids_per_entity=20,
+        max_source_ids_per_relation=300,
+        source_ids_limit_method=SOURCE_IDS_LIMIT_METHOD_KEEP,
+    )
 
     result = await _merge_nodes_then_upsert(
         entity_name="LegacyEntity",
         nodes_data=[],
         knowledge_graph_inst=graph,
         entity_vdb=None,
-        global_config=global_config,
+        config=config,
     )
 
     assert result["description"] == "Entity LegacyEntity"

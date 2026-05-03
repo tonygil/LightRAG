@@ -93,6 +93,7 @@ from lightrag.operate import (
     naive_query,
     rebuild_knowledge_from_chunks,
 )
+from lightrag.config import PipelineConfig
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.utils import (
     Tokenizer,
@@ -527,6 +528,38 @@ class LightRAG:
     """Configuration for Ollama server information."""
 
     _storages_status: StoragesStatus = field(default=StoragesStatus.NOT_CREATED)
+
+    def _pipeline_config(self) -> PipelineConfig:
+        """Build a typed PipelineConfig from this instance's fields.
+
+        Called at each pipeline entry point instead of passing asdict(self).
+        """
+        addon = self.addon_params or {}
+        return PipelineConfig(
+            llm_model_func=self.llm_model_func,
+            tokenizer=self.tokenizer,
+            entity_extract_max_gleaning=self.entity_extract_max_gleaning,
+            max_extract_input_tokens=self.max_extract_input_tokens,
+            summary_context_size=self.summary_context_size,
+            summary_max_tokens=self.summary_max_tokens,
+            summary_length_recommended=self.summary_length_recommended,
+            force_llm_summary_on_merge=self.force_llm_summary_on_merge,
+            max_source_ids_per_entity=self.max_source_ids_per_entity,
+            max_source_ids_per_relation=self.max_source_ids_per_relation,
+            source_ids_limit_method=self.source_ids_limit_method,
+            max_file_paths=self.max_file_paths,
+            file_path_more_placeholder=self.file_path_more_placeholder,
+            max_entity_tokens=self.max_entity_tokens,
+            max_relation_tokens=self.max_relation_tokens,
+            max_total_tokens=self.max_total_tokens,
+            llm_model_max_async=self.llm_model_max_async,
+            workspace=self.workspace or "",
+            language=addon.get("language", DEFAULT_SUMMARY_LANGUAGE),
+            entity_types=addon.get("entity_types", list(DEFAULT_ENTITY_TYPES)),
+            embedding_token_limit=self.embedding_token_limit,
+            rerank_model_func=self.rerank_model_func,
+            min_rerank_score=self.min_rerank_score,
+        )
 
     def __post_init__(self):
         from lightrag.kg.shared_storage import (
@@ -2138,7 +2171,7 @@ class LightRAG:
                                     knowledge_graph_inst=self.chunk_entity_relation_graph,
                                     entity_vdb=self.entities_vdb,
                                     relationships_vdb=self.relationships_vdb,
-                                    global_config=asdict(self),
+                                    config=self._pipeline_config(),
                                     full_entities_storage=self.full_entities,
                                     full_relations_storage=self.full_relations,
                                     doc_id=doc_id,
@@ -2321,7 +2354,7 @@ class LightRAG:
         try:
             chunk_results = await extract_entities(
                 chunk,
-                global_config=asdict(self),
+                config=self._pipeline_config(),
                 pipeline_status=pipeline_status,
                 pipeline_status_lock=pipeline_status_lock,
                 llm_response_cache=self.llm_response_cache,
@@ -2785,7 +2818,7 @@ class LightRAG:
             actual data is nested under the 'data' field, with 'status' and 'message'
             fields at the top level.
         """
-        global_config = asdict(self)
+        config = self._pipeline_config()
 
         # Create a copy of param to avoid modifying the original
         data_param = QueryParam(
@@ -2819,7 +2852,7 @@ class LightRAG:
                 self.relationships_vdb,
                 self.text_chunks,
                 data_param,  # Use data_param with only_need_context=True
-                global_config,
+                config,
                 hashing_kv=self.llm_response_cache,
                 system_prompt=None,
                 chunks_vdb=self.chunks_vdb,
@@ -2830,7 +2863,7 @@ class LightRAG:
                 query.strip(),
                 self.chunks_vdb,
                 data_param,  # Use data_param with only_need_context=True
-                global_config,
+                config,
                 hashing_kv=self.llm_response_cache,
                 system_prompt=None,
             )
@@ -2903,7 +2936,7 @@ class LightRAG:
         """
         logger.debug(f"[aquery_llm] Query param: {param}")
 
-        global_config = asdict(self)
+        config = self._pipeline_config()
 
         try:
             query_result = None
@@ -2916,7 +2949,7 @@ class LightRAG:
                     self.relationships_vdb,
                     self.text_chunks,
                     param,
-                    global_config,
+                    config,
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
                     chunks_vdb=self.chunks_vdb,
@@ -2926,13 +2959,13 @@ class LightRAG:
                     query.strip(),
                     self.chunks_vdb,
                     param,
-                    global_config,
+                    config,
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
                 )
             elif param.mode == "bypass":
                 # Bypass mode: directly use LLM without knowledge retrieval
-                use_llm_func = param.model_func or global_config["llm_model_func"]
+                use_llm_func = param.model_func or config.llm_model_func
                 # Apply higher priority (8) to entity/relation summary tasks
                 use_llm_func = partial(use_llm_func, _priority=8)
 
@@ -3955,7 +3988,7 @@ class LightRAG:
                         relationships_vdb=self.relationships_vdb,
                         text_chunks_storage=self.text_chunks,
                         llm_response_cache=self.llm_response_cache,
-                        global_config=asdict(self),
+                        config=self._pipeline_config(),
                         pipeline_status=pipeline_status,
                         pipeline_status_lock=pipeline_status_lock,
                         entity_chunks_storage=self.entity_chunks,

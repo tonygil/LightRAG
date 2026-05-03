@@ -43,6 +43,7 @@ from lightrag.constants import (
     VALID_SOURCE_IDS_LIMIT_METHODS,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
 )
+from lightrag.config import PipelineConfig
 
 # Precompile regex pattern for JSON sanitization (module-level, compiled once)
 _SURROGATE_PATTERN = re.compile(r"[\uD800-\uDFFF\uFFFE\uFFFF]")
@@ -2638,7 +2639,7 @@ class TokenTracker:
 async def apply_rerank_if_enabled(
     query: str,
     retrieved_docs: list[dict],
-    global_config: dict,
+    config: PipelineConfig,
     enable_rerank: bool = True,
     top_n: int = None,
 ) -> list[dict]:
@@ -2658,7 +2659,7 @@ async def apply_rerank_if_enabled(
     if not enable_rerank or not retrieved_docs:
         return retrieved_docs
 
-    rerank_func = global_config.get("rerank_model_func")
+    rerank_func = config.rerank_model_func
     if not rerank_func:
         logger.warning(
             "Rerank is enabled but no rerank model is configured. Please set up a rerank model or set enable_rerank=False in query parameters."
@@ -2723,9 +2724,9 @@ async def process_chunks_unified(
     query: str,
     unique_chunks: list[dict],
     query_param: "QueryParam",
-    global_config: dict,
+    config: PipelineConfig,
     source_type: str = "mixed",
-    chunk_token_limit: int = None,  # Add parameter for dynamic token limit
+    chunk_token_limit: int = None,
 ) -> list[dict]:
     """
     Unified processing for text chunks: deduplication, chunk_top_k limiting, reranking, and token truncation.
@@ -2752,14 +2753,14 @@ async def process_chunks_unified(
         unique_chunks = await apply_rerank_if_enabled(
             query=query,
             retrieved_docs=unique_chunks,
-            global_config=global_config,
+            config=config,
             enable_rerank=query_param.enable_rerank,
             top_n=rerank_top_k,
         )
 
     # 2. Filter by minimum rerank score if reranking is enabled
     if query_param.enable_rerank and unique_chunks:
-        min_rerank_score = global_config.get("min_rerank_score", 0.5)
+        min_rerank_score = config.min_rerank_score
         if min_rerank_score > 0.0:
             original_count = len(unique_chunks)
 
@@ -2791,15 +2792,14 @@ async def process_chunks_unified(
         )
 
     # 4. Token-based final truncation
-    tokenizer = global_config.get("tokenizer")
+    tokenizer = config.tokenizer
     if tokenizer and unique_chunks:
         # Set default chunk_token_limit if not provided
         if chunk_token_limit is None:
-            # Get default from query_param or global_config
             chunk_token_limit = getattr(
                 query_param,
                 "max_total_tokens",
-                global_config.get("MAX_TOTAL_TOKENS", DEFAULT_MAX_TOTAL_TOKENS),
+                config.max_total_tokens,
             )
 
         original_count = len(unique_chunks)

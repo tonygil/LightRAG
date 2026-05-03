@@ -68,6 +68,7 @@ from lightrag.constants import (
     DEFAULT_ENTITY_NAME_MAX_LENGTH,
 )
 from lightrag.kg.shared_storage import get_storage_keyed_lock
+from lightrag.config import PipelineConfig
 import time
 from dotenv import load_dotenv
 
@@ -169,7 +170,7 @@ async def _handle_entity_relation_summary(
     entity_or_relation_name: str,
     description_list: list[str],
     separator: str,
-    global_config: dict,
+    config: PipelineConfig,
     llm_response_cache: BaseKVStorage | None = None,
 ) -> tuple[str, bool]:
     """Handle entity relation description summary using map-reduce approach.
@@ -199,10 +200,10 @@ async def _handle_entity_relation_summary(
         return description_list[0], False
 
     # Get configuration
-    tokenizer: Tokenizer = global_config["tokenizer"]
-    summary_context_size = global_config["summary_context_size"]
-    summary_max_tokens = global_config["summary_max_tokens"]
-    force_llm_summary_on_merge = global_config["force_llm_summary_on_merge"]
+    tokenizer: Tokenizer = config.tokenizer
+    summary_context_size = config.summary_context_size
+    summary_max_tokens = config.summary_max_tokens
+    force_llm_summary_on_merge = config.force_llm_summary_on_merge
 
     current_list = description_list[:]  # Copy the list to avoid modifying original
     llm_was_used = False  # Track whether LLM was used during the entire process
@@ -235,7 +236,7 @@ async def _handle_entity_relation_summary(
                     description_type,
                     entity_or_relation_name,
                     current_list,
-                    global_config,
+                    config,
                     llm_response_cache,
                 )
                 return final_summary, True  # LLM was used for final summarization
@@ -291,7 +292,7 @@ async def _handle_entity_relation_summary(
                     description_type,
                     entity_or_relation_name,
                     chunk,
-                    global_config,
+                    config,
                     llm_response_cache,
                 )
                 new_summaries.append(summary)
@@ -305,7 +306,7 @@ async def _summarize_descriptions(
     description_type: str,
     description_name: str,
     description_list: list[str],
-    global_config: dict,
+    config: PipelineConfig,
     llm_response_cache: BaseKVStorage | None = None,
 ) -> str:
     """Helper function to summarize a list of descriptions using LLM.
@@ -319,19 +320,19 @@ async def _summarize_descriptions(
     Returns:
         Summarized description string
     """
-    use_llm_func: callable = global_config["llm_model_func"]
+    use_llm_func: callable = config.llm_model_func
     # Apply higher priority (8) to entity/relation summary tasks
     use_llm_func = partial(use_llm_func, _priority=8)
 
-    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
+    language = config.language
 
-    summary_length_recommended = global_config["summary_length_recommended"]
+    summary_length_recommended = config.summary_length_recommended
 
     prompt_template = PROMPTS["summarize_entity_descriptions"]
 
     # Convert descriptions to JSONL format and apply token-based truncation
-    tokenizer = global_config["tokenizer"]
-    summary_context_size = global_config["summary_context_size"]
+    tokenizer = config.tokenizer
+    summary_context_size = config.summary_context_size
 
     # Create list of JSON objects with "Description" field
     json_descriptions = [{"Description": desc} for desc in description_list]
@@ -368,9 +369,9 @@ async def _summarize_descriptions(
     )
 
     # Check summary token length against embedding limit
-    embedding_token_limit = global_config.get("embedding_token_limit")
+    embedding_token_limit = config.embedding_token_limit
     if embedding_token_limit is not None and summary:
-        tokenizer = global_config["tokenizer"]
+        tokenizer = config.tokenizer
         summary_token_count = len(tokenizer.encode(summary))
         threshold = int(embedding_token_limit)
 
@@ -565,7 +566,7 @@ async def rebuild_knowledge_from_chunks(
     relationships_vdb: BaseVectorStorage,
     text_chunks_storage: BaseKVStorage,
     llm_response_cache: BaseKVStorage,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     pipeline_status: dict | None = None,
     pipeline_status_lock=None,
     entity_chunks_storage: BaseKVStorage | None = None,
@@ -702,8 +703,8 @@ async def rebuild_knowledge_from_chunks(
                     pipeline_status["history_messages"].append(status_message)
             continue
 
-    # Get max async tasks limit from global_config for semaphore control
-    graph_max_async = global_config.get("llm_model_max_async", 4) * 2
+    # Get max async tasks limit from config for semaphore control
+    graph_max_async = config.llm_model_max_async * 2
     semaphore = asyncio.Semaphore(graph_max_async)
 
     # Counters for tracking progress
@@ -715,7 +716,7 @@ async def rebuild_knowledge_from_chunks(
     async def _locked_rebuild_entity(entity_name, chunk_ids):
         nonlocal rebuilt_entities_count, failed_entities_count
         async with semaphore:
-            workspace = global_config.get("workspace", "")
+            workspace = config.workspace
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             async with get_storage_keyed_lock(
                 [entity_name], namespace=namespace, enable_logging=False
@@ -728,7 +729,7 @@ async def rebuild_knowledge_from_chunks(
                         chunk_ids=chunk_ids,
                         chunk_entities=chunk_entities,
                         llm_response_cache=llm_response_cache,
-                        global_config=global_config,
+                        config=config,
                         entity_chunks_storage=entity_chunks_storage,
                     )
                     rebuilt_entities_count += 1
@@ -744,7 +745,7 @@ async def rebuild_knowledge_from_chunks(
     async def _locked_rebuild_relationship(src, tgt, chunk_ids):
         nonlocal rebuilt_relationships_count, failed_relationships_count
         async with semaphore:
-            workspace = global_config.get("workspace", "")
+            workspace = config.workspace
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             # Sort src and tgt to ensure order-independent lock key generation
             sorted_key_parts = sorted([src, tgt])
@@ -763,7 +764,7 @@ async def rebuild_knowledge_from_chunks(
                         chunk_ids=chunk_ids,
                         chunk_relationships=chunk_relationships,
                         llm_response_cache=llm_response_cache,
-                        global_config=global_config,
+                        config=config,
                         relation_chunks_storage=relation_chunks_storage,
                         entity_chunks_storage=entity_chunks_storage,
                         pipeline_status=pipeline_status,
@@ -1105,7 +1106,7 @@ async def _rebuild_single_entity(
     chunk_ids: list[str],
     chunk_entities: dict,
     llm_response_cache: BaseKVStorage,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     entity_chunks_storage: BaseKVStorage | None = None,
     pipeline_status: dict | None = None,
     pipeline_status_lock=None,
@@ -1183,12 +1184,12 @@ async def _rebuild_single_entity(
         )
 
     limit_method = (
-        global_config.get("source_ids_limit_method") or SOURCE_IDS_LIMIT_METHOD_KEEP
+        config.source_ids_limit_method or SOURCE_IDS_LIMIT_METHOD_KEEP
     )
 
     limited_chunk_ids = apply_source_ids_limit(
         normalized_chunk_ids,
-        global_config["max_source_ids_per_entity"],
+        config.max_source_ids_per_entity,
         limit_method,
         identifier=f"`{entity_name}`",
     )
@@ -1235,7 +1236,7 @@ async def _rebuild_single_entity(
                 entity_name,
                 description_list,
                 GRAPH_FIELD_SEP,
-                global_config,
+                config,
                 llm_response_cache=llm_response_cache,
             )
         else:
@@ -1268,11 +1269,9 @@ async def _rebuild_single_entity(
                 seen_paths.add(file_path)
 
     # Apply MAX_FILE_PATHS limit
-    max_file_paths = global_config.get("max_file_paths", DEFAULT_MAX_FILE_PATHS)
-    file_path_placeholder = global_config.get(
-        "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
-    )
-    limit_method = global_config.get("source_ids_limit_method")
+    max_file_paths = config.max_file_paths
+    file_path_placeholder = config.file_path_more_placeholder
+    limit_method = config.source_ids_limit_method
 
     original_count = len(file_paths_list)
     if original_count > max_file_paths:
@@ -1308,7 +1307,7 @@ async def _rebuild_single_entity(
             entity_name,
             description_list,
             GRAPH_FIELD_SEP,
-            global_config,
+            config,
             llm_response_cache=llm_response_cache,
         )
     else:
@@ -1350,7 +1349,7 @@ async def _rebuild_single_relationship(
     chunk_ids: list[str],
     chunk_relationships: dict,
     llm_response_cache: BaseKVStorage,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
     pipeline_status: dict | None = None,
@@ -1382,11 +1381,11 @@ async def _rebuild_single_relationship(
         )
 
     limit_method = (
-        global_config.get("source_ids_limit_method") or SOURCE_IDS_LIMIT_METHOD_KEEP
+        config.source_ids_limit_method or SOURCE_IDS_LIMIT_METHOD_KEEP
     )
     limited_chunk_ids = apply_source_ids_limit(
         normalized_chunk_ids,
-        global_config["max_source_ids_per_relation"],
+        config.max_source_ids_per_relation,
         limit_method,
         identifier=f"`{src}`~`{tgt}`",
     )
@@ -1427,11 +1426,9 @@ async def _rebuild_single_relationship(
                 seen_paths.add(file_path)
 
     # Apply count limit
-    max_file_paths = global_config.get("max_file_paths", DEFAULT_MAX_FILE_PATHS)
-    file_path_placeholder = global_config.get(
-        "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
-    )
-    limit_method = global_config.get("source_ids_limit_method")
+    max_file_paths = config.max_file_paths
+    file_path_placeholder = config.file_path_more_placeholder
+    limit_method = config.source_ids_limit_method
 
     original_count = len(file_paths_list)
     if original_count > max_file_paths:
@@ -1468,7 +1465,7 @@ async def _rebuild_single_relationship(
             f"{src}-{tgt}",
             description_list,
             GRAPH_FIELD_SEP,
-            global_config,
+            config,
             llm_response_cache=llm_response_cache,
         )
     else:
@@ -1625,7 +1622,7 @@ async def _merge_nodes_then_upsert(
     nodes_data: list[dict],
     knowledge_graph_inst: BaseGraphStorage,
     entity_vdb: BaseVectorStorage | None,
-    global_config: dict,
+    config: PipelineConfig,
     pipeline_status: dict = None,
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
@@ -1702,8 +1699,8 @@ async def _merge_nodes_then_upsert(
             )
 
         # 3. Finalize source_id by applying source ids limit
-        limit_method = global_config.get("source_ids_limit_method")
-        max_source_limit = global_config.get("max_source_ids_per_entity")
+        limit_method = config.source_ids_limit_method
+        max_source_limit = config.max_source_ids_per_entity
         source_ids = apply_source_ids_limit(
             full_source_ids,
             max_source_limit,
@@ -1801,7 +1798,7 @@ async def _merge_nodes_then_upsert(
             entity_name,
             description_list,
             GRAPH_FIELD_SEP,
-            global_config,
+            config,
             llm_response_cache,
         )
 
@@ -1810,10 +1807,8 @@ async def _merge_nodes_then_upsert(
         seen_paths = set()
         has_placeholder = False  # Indicating file_path has been truncated before
 
-        max_file_paths = global_config.get("max_file_paths", DEFAULT_MAX_FILE_PATHS)
-        file_path_placeholder = global_config.get(
-            "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
-        )
+        max_file_paths = config.max_file_paths
+        file_path_placeholder = config.file_path_more_placeholder
 
         # Collect from already_file_paths, excluding placeholder
         for fp in already_file_paths:
@@ -1834,12 +1829,7 @@ async def _merge_nodes_then_upsert(
 
         # Apply count limit
         if len(file_paths_list) > max_file_paths:
-            limit_method = global_config.get(
-                "source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP
-            )
-            file_path_placeholder = global_config.get(
-                "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
-            )
+            limit_method = config.source_ids_limit_method or SOURCE_IDS_LIMIT_METHOD_KEEP
             # Add + sign to indicate actual file count is higher
             original_count_str = (
                 f"{len(file_paths_list)}+"
@@ -1952,7 +1942,7 @@ async def _merge_edges_then_upsert(
     knowledge_graph_inst: BaseGraphStorage,
     relationships_vdb: BaseVectorStorage | None,
     entity_vdb: BaseVectorStorage | None,
-    global_config: dict,
+    config: PipelineConfig,
     pipeline_status: dict = None,
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
@@ -2039,8 +2029,8 @@ async def _merge_edges_then_upsert(
             )
 
         # 3. Finalize source_id by applying source ids limit
-        limit_method = global_config.get("source_ids_limit_method")
-        max_source_limit = global_config.get("max_source_ids_per_relation")
+        limit_method = config.source_ids_limit_method
+        max_source_limit = config.max_source_ids_per_relation
         source_ids = apply_source_ids_limit(
             full_source_ids,
             max_source_limit,
@@ -2048,7 +2038,7 @@ async def _merge_edges_then_upsert(
             identifier=f"`{src_id}`~`{tgt_id}`",
         )
         limit_method = (
-            global_config.get("source_ids_limit_method") or SOURCE_IDS_LIMIT_METHOD_KEEP
+            config.source_ids_limit_method or SOURCE_IDS_LIMIT_METHOD_KEEP
         )
 
         # 4. Only keep edges with source_id in the final source_ids list if in KEEP mode
@@ -2151,7 +2141,7 @@ async def _merge_edges_then_upsert(
             f"({src_id}, {tgt_id})",
             description_list,
             GRAPH_FIELD_SEP,
-            global_config,
+            config,
             llm_response_cache,
         )
 
@@ -2160,10 +2150,8 @@ async def _merge_edges_then_upsert(
         seen_paths = set()
         has_placeholder = False  # Track if already_file_paths contains placeholder
 
-        max_file_paths = global_config.get("max_file_paths", DEFAULT_MAX_FILE_PATHS)
-        file_path_placeholder = global_config.get(
-            "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
-        )
+        max_file_paths = config.max_file_paths
+        file_path_placeholder = config.file_path_more_placeholder
 
         # Collect from already_file_paths, excluding placeholder
         for fp in already_file_paths:
@@ -2185,9 +2173,7 @@ async def _merge_edges_then_upsert(
 
         # Apply count limit
         if len(file_paths_list) > max_file_paths:
-            limit_method = global_config.get(
-                "source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP
-            )
+            limit_method = config.source_ids_limit_method or SOURCE_IDS_LIMIT_METHOD_KEEP
 
             # Add + sign to indicate actual file count is higher
             original_count_str = (
@@ -2364,10 +2350,8 @@ async def _merge_edges_then_upsert(
                     )
 
                 # 4. Apply source_ids limit for graph and vector db
-                limit_method = global_config.get(
-                    "source_ids_limit_method", SOURCE_IDS_LIMIT_METHOD_KEEP
-                )
-                max_source_limit = global_config.get("max_source_ids_per_entity")
+                limit_method = config.source_ids_limit_method or SOURCE_IDS_LIMIT_METHOD_KEEP
+                max_source_limit = config.max_source_ids_per_entity
                 limited_source_ids = apply_source_ids_limit(
                     merged_full_source_ids,
                     max_source_limit,
@@ -2503,7 +2487,7 @@ async def merge_nodes_and_edges(
     knowledge_graph_inst: BaseGraphStorage,
     entity_vdb: BaseVectorStorage,
     relationships_vdb: BaseVectorStorage,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     full_entities_storage: BaseKVStorage = None,
     full_relations_storage: BaseKVStorage = None,
     doc_id: str = None,
@@ -2573,7 +2557,7 @@ async def merge_nodes_and_edges(
         pipeline_status["history_messages"].append(log_message)
 
     # Get max async tasks limit from global_config for semaphore control
-    graph_max_async = global_config.get("llm_model_max_async", 4) * 2
+    graph_max_async = config.llm_model_max_async * 2
     semaphore = asyncio.Semaphore(graph_max_async)
 
     # ===== Phase 1: Process all entities concurrently =====
@@ -2593,7 +2577,7 @@ async def merge_nodes_and_edges(
                             "User cancelled during entity merge"
                         )
 
-            workspace = global_config.get("workspace", "")
+            workspace = config.workspace
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             async with get_storage_keyed_lock(
                 [entity_name], namespace=namespace, enable_logging=False
@@ -2605,7 +2589,7 @@ async def merge_nodes_and_edges(
                         entities,
                         knowledge_graph_inst,
                         entity_vdb,
-                        global_config,
+                        config,
                         pipeline_status,
                         pipeline_status_lock,
                         llm_response_cache,
@@ -2698,7 +2682,7 @@ async def merge_nodes_and_edges(
                             "User cancelled during relation merge"
                         )
 
-            workspace = global_config.get("workspace", "")
+            workspace = config.workspace
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             sorted_edge_key = sorted([edge_key[0], edge_key[1]])
 
@@ -2718,7 +2702,7 @@ async def merge_nodes_and_edges(
                         knowledge_graph_inst,
                         relationships_vdb,
                         entity_vdb,
-                        global_config,
+                        config,
                         pipeline_status,
                         pipeline_status_lock,
                         llm_response_cache,
@@ -2882,7 +2866,7 @@ async def merge_nodes_and_edges(
 
 async def extract_entities(
     chunks: dict[str, TextChunkSchema],
-    global_config: dict[str, str],
+    config: PipelineConfig,
     pipeline_status: dict = None,
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
@@ -2896,15 +2880,13 @@ async def extract_entities(
                     "User cancelled during entity extraction"
                 )
 
-    use_llm_func: callable = global_config["llm_model_func"]
-    entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
+    use_llm_func: callable = config.llm_model_func
+    entity_extract_max_gleaning = config.entity_extract_max_gleaning
 
     ordered_chunks = list(chunks.items())
     # add language and example number params to prompt
-    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
-    entity_types = global_config["addon_params"].get(
-        "entity_types", DEFAULT_ENTITY_TYPES
-    )
+    language = config.language
+    entity_types = config.entity_types
 
     examples = "\n".join(PROMPTS["entity_extraction_examples"])
 
@@ -2986,8 +2968,8 @@ async def extract_entities(
         # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
         if entity_extract_max_gleaning > 0:
             # Calculate total tokens for the gleaning request to prevent context window overflow
-            tokenizer = global_config["tokenizer"]
-            max_input_tokens = global_config["max_extract_input_tokens"]
+            tokenizer = config.tokenizer
+            max_input_tokens = config.max_extract_input_tokens
 
             # Approximate total tokens: system prompt + history + user prompt.
             # This slightly underestimates actual API usage (missing role/framing tokens)
@@ -3089,8 +3071,8 @@ async def extract_entities(
         # Return the extracted nodes and edges for centralized processing
         return maybe_nodes, maybe_edges
 
-    # Get max async tasks limit from global_config
-    chunk_max_async = global_config.get("llm_model_max_async", 4)
+    # Get max async tasks limit from config
+    chunk_max_async = config.llm_model_max_async
     semaphore = asyncio.Semaphore(chunk_max_async)
 
     async def _process_with_semaphore(chunk):
@@ -3168,7 +3150,7 @@ async def kg_query(
     relationships_vdb: BaseVectorStorage,
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     chunks_vdb: BaseVectorStorage = None,
@@ -3209,12 +3191,12 @@ async def kg_query(
     if query_param.model_func:
         use_model_func = query_param.model_func
     else:
-        use_model_func = global_config["llm_model_func"]
+        use_model_func = config.llm_model_func
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
 
     hl_keywords, ll_keywords = await get_keywords_from_query(
-        query, query_param, global_config, hashing_kv
+        query, query_param, config, hashing_kv
     )
 
     logger.debug(f"High-level keywords: {hl_keywords}")
@@ -3245,6 +3227,7 @@ async def kg_query(
         relationships_vdb,
         text_chunks_db,
         query_param,
+        config,
         chunks_vdb,
     )
 
@@ -3280,7 +3263,7 @@ async def kg_query(
         return QueryResult(content=prompt_content, raw_data=context_result.raw_data)
 
     # Call LLM
-    tokenizer: Tokenizer = global_config["tokenizer"]
+    tokenizer: Tokenizer = config.tokenizer
     len_of_prompts = len(tokenizer.encode(query + sys_prompt))
     logger.debug(
         f"[kg_query] Sending to LLM: {len_of_prompts:,} tokens (Query: {len(tokenizer.encode(query))}, System: {len(tokenizer.encode(sys_prompt))})"
@@ -3374,7 +3357,7 @@ async def kg_query(
 async def get_keywords_from_query(
     query: str,
     query_param: QueryParam,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     hashing_kv: BaseKVStorage | None = None,
 ) -> tuple[list[str], list[str]]:
     """
@@ -3398,7 +3381,7 @@ async def get_keywords_from_query(
 
     # Extract keywords using extract_keywords_only function which already supports conversation history
     hl_keywords, ll_keywords = await extract_keywords_only(
-        query, query_param, global_config, hashing_kv
+        query, query_param, config, hashing_kv
     )
     return hl_keywords, ll_keywords
 
@@ -3406,7 +3389,7 @@ async def get_keywords_from_query(
 async def extract_keywords_only(
     text: str,
     param: QueryParam,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     hashing_kv: BaseKVStorage | None = None,
 ) -> tuple[list[str], list[str]]:
     """
@@ -3418,7 +3401,7 @@ async def extract_keywords_only(
     # 1. Build the examples
     examples = "\n".join(PROMPTS["keywords_extraction_examples"])
 
-    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
+    language = config.language
 
     # 2. Handle cache if needed - add cache type for keywords
     args_hash = compute_args_hash(
@@ -3448,7 +3431,7 @@ async def extract_keywords_only(
         language=language,
     )
 
-    tokenizer: Tokenizer = global_config["tokenizer"]
+    tokenizer: Tokenizer = config.tokenizer
     len_of_prompts = len(tokenizer.encode(kw_prompt))
     logger.debug(
         f"[extract_keywords] Sending to LLM: {len_of_prompts:,} tokens (Prompt: {len_of_prompts})"
@@ -3458,7 +3441,7 @@ async def extract_keywords_only(
     if param.model_func:
         use_model_func = param.model_func
     else:
-        use_model_func = global_config["llm_model_func"]
+        use_model_func = config.llm_model_func
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
 
@@ -3783,12 +3766,12 @@ async def _perform_kg_search(
 async def _apply_token_truncation(
     search_result: dict[str, Any],
     query_param: QueryParam,
-    global_config: dict[str, str],
+    config: PipelineConfig,
 ) -> dict[str, Any]:
     """
     Apply token-based truncation to entities and relations for LLM efficiency.
     """
-    tokenizer = global_config.get("tokenizer")
+    tokenizer = config.tokenizer
     if not tokenizer:
         logger.warning("No tokenizer found, skipping truncation")
         return {
@@ -3804,12 +3787,12 @@ async def _apply_token_truncation(
     max_entity_tokens = getattr(
         query_param,
         "max_entity_tokens",
-        global_config.get("max_entity_tokens", DEFAULT_MAX_ENTITY_TOKENS),
+        config.max_entity_tokens,
     )
     max_relation_tokens = getattr(
         query_param,
         "max_relation_tokens",
-        global_config.get("max_relation_tokens", DEFAULT_MAX_RELATION_TOKENS),
+        config.max_relation_tokens,
     )
 
     final_entities = search_result["final_entities"]
@@ -4059,7 +4042,7 @@ async def _build_context_str(
     merged_chunks: list[dict],
     query: str,
     query_param: QueryParam,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     chunk_tracking: dict = None,
     entity_id_to_original: dict = None,
     relation_id_to_original: dict = None,
@@ -4068,7 +4051,7 @@ async def _build_context_str(
     Build the final LLM context string with token processing.
     This includes dynamic token calculation and final chunk truncation.
     """
-    tokenizer = global_config.get("tokenizer")
+    tokenizer = config.tokenizer
     if not tokenizer:
         logger.error("Missing tokenizer, cannot build LLM context")
         # Return empty raw data structure when no tokenizer
@@ -4087,13 +4070,11 @@ async def _build_context_str(
     max_total_tokens = getattr(
         query_param,
         "max_total_tokens",
-        global_config.get("max_total_tokens", DEFAULT_MAX_TOTAL_TOKENS),
+        config.max_total_tokens,
     )
 
-    # Get the system prompt template from PROMPTS or global_config
-    sys_prompt_template = global_config.get(
-        "system_prompt_template", PROMPTS["rag_response"]
-    )
+    # Get the system prompt template from PROMPTS or config
+    sys_prompt_template = config.system_prompt_template or PROMPTS["rag_response"]
 
     kg_context_template = PROMPTS["kg_query_context"]
     user_prompt = query_param.user_prompt if query_param.user_prompt else ""
@@ -4143,7 +4124,7 @@ async def _build_context_str(
         query=query,
         unique_chunks=merged_chunks,
         query_param=query_param,
-        global_config=global_config,
+        config=config,
         source_type=query_param.mode,
         chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
     )
@@ -4245,6 +4226,7 @@ async def _build_query_context(
     relationships_vdb: BaseVectorStorage,
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
+    config: PipelineConfig,
     chunks_vdb: BaseVectorStorage = None,
 ) -> QueryContextResult | None:
     """
@@ -4282,7 +4264,7 @@ async def _build_query_context(
     truncation_result = await _apply_token_truncation(
         search_result,
         query_param,
-        text_chunks_db.global_config,
+        config,
     )
 
     # Stage 3: Merge chunks using filtered entities/relations
@@ -4314,7 +4296,7 @@ async def _build_query_context(
         merged_chunks=merged_chunks,
         query=query,
         query_param=query_param,
-        global_config=text_chunks_db.global_config,
+        config=config,
         chunk_tracking=search_result["chunk_tracking"],
         entity_id_to_original=truncation_result["entity_id_to_original"],
         relation_id_to_original=truncation_result["relation_id_to_original"],
@@ -4931,7 +4913,7 @@ async def naive_query(
     query: str,
     chunks_vdb: BaseVectorStorage,
     query_param: QueryParam,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     return_raw_data: Literal[True] = True,
@@ -4943,7 +4925,7 @@ async def naive_query(
     query: str,
     chunks_vdb: BaseVectorStorage,
     query_param: QueryParam,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     return_raw_data: Literal[False] = False,
@@ -4954,7 +4936,7 @@ async def naive_query(
     query: str,
     chunks_vdb: BaseVectorStorage,
     query_param: QueryParam,
-    global_config: dict[str, str],
+    config: PipelineConfig,
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
 ) -> QueryResult | None:
@@ -4985,11 +4967,11 @@ async def naive_query(
     if query_param.model_func:
         use_model_func = query_param.model_func
     else:
-        use_model_func = global_config["llm_model_func"]
+        use_model_func = config.llm_model_func
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
 
-    tokenizer: Tokenizer = global_config["tokenizer"]
+    tokenizer: Tokenizer = config.tokenizer
     if not tokenizer:
         logger.error("Tokenizer not found in global configuration.")
         return QueryResult(content=PROMPTS["fail_response"])
@@ -5006,7 +4988,7 @@ async def naive_query(
     max_total_tokens = getattr(
         query_param,
         "max_total_tokens",
-        global_config.get("max_total_tokens", DEFAULT_MAX_TOTAL_TOKENS),
+        config.max_total_tokens,
     )
 
     # Calculate system prompt template tokens (excluding content_data)
@@ -5046,7 +5028,7 @@ async def naive_query(
         query=query,
         unique_chunks=chunks,
         query_param=query_param,
-        global_config=global_config,
+        config=config,
         source_type="vector",
         chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
     )
