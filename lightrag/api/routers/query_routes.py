@@ -4,6 +4,7 @@ This module contains all query-related routes for the LightRAG API.
 
 import functools
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,20 +15,29 @@ from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(tags=["query"])
 
+_ARTICLE_ID_RE = re.compile(r"^(\d+)_")
+_SUPPORT_BASE = "https://support.wolterskluwer.co.uk/hc/en-gb/articles"
+
 
 @functools.lru_cache(maxsize=512)
 def _extract_article_meta(file_path: str) -> tuple[str, str]:
-    """Return (title, source_url) from the header block of an enriched markdown file."""
-    title, url = "", ""
+    """Return (title, source_url) for an enriched markdown file.
+
+    URL is derived from the numeric article ID prefix in the filename
+    (e.g. 3126957_... → https://support.wolterskluwer.co.uk/hc/en-gb/articles/3126957).
+    Title is read from the # heading in the file.
+    """
+    fname = Path(file_path).name
+    m = _ARTICLE_ID_RE.match(fname)
+    url = f"{_SUPPORT_BASE}/{m.group(1)}" if m else ""
+
+    title = ""
     try:
         with open(file_path, encoding="utf-8") as f:
             header = f.read(1024)
         for line in header.splitlines():
-            if not title and line.startswith("# "):
+            if line.startswith("# "):
                 title = line[2:].strip()
-            if "**Source URL:**" in line:
-                url = line.split("**Source URL:**", 1)[1].strip()
-            if title and url:
                 break
     except OSError:
         pass
