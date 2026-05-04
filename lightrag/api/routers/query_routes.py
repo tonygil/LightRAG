@@ -57,6 +57,26 @@ def _build_sources_section(references: list[dict], input_dir: str = "") -> str:
     return "\n\n**Sources:**\n" + "\n".join(items)
 
 
+def _enrich_references_with_meta(references: list[dict], input_dir: str = "") -> list[dict]:
+    """Add 'title' and 'url' to each reference dict by reading article metadata."""
+    base = Path(input_dir) if input_dir else None
+    enriched = []
+    for ref in references:
+        fp = ref.get("file_path", "")
+        ref_copy = ref.copy()
+        if fp:
+            p = Path(fp)
+            if base and not p.is_absolute():
+                p = base / p
+            title, url = _extract_article_meta(str(p))
+            if title:
+                ref_copy["title"] = title
+            if url:
+                ref_copy["url"] = url
+        enriched.append(ref_copy)
+    return enriched
+
+
 class QueryRequest(BaseModel):
     query: str = Field(
         min_length=3,
@@ -192,6 +212,8 @@ class ReferenceItem(BaseModel):
 
     reference_id: str = Field(description="Unique reference identifier")
     file_path: str = Field(description="Path to the source file")
+    title: Optional[str] = Field(default=None, description="Article title from document metadata")
+    url: Optional[str] = Field(default=None, description="External source URL from document metadata")
     content: Optional[List[str]] = Field(
         default=None,
         description="List of chunk contents from this file (only present when include_chunk_content=True)",
@@ -460,7 +482,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})
             data = result.get("data", {})
-            references = data.get("references", [])
+            references = _enrich_references_with_meta(
+                data.get("references", []), input_dir
+            )
 
             # Get the non-streaming response content
             response_content = llm_response.get("content", "")
@@ -719,7 +743,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, def
 
             async def stream_generator():
                 # Extract references and LLM response from unified result
-                references = result.get("data", {}).get("references", [])
+                references = _enrich_references_with_meta(
+                    result.get("data", {}).get("references", []), input_dir
+                )
                 llm_response = result.get("llm_response", {})
 
                 # Enrich references with chunk content if requested
