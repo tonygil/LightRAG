@@ -23,24 +23,28 @@ _SUPPORT_BASE = "https://support.wolterskluwer.co.uk/hc/en-gb/articles"
 def _extract_article_meta(file_path: str) -> tuple[str, str]:
     """Return (title, source_url) for an enriched markdown file.
 
-    URL is derived from the numeric article ID prefix in the filename
-    (e.g. 3126957_... → https://support.wolterskluwer.co.uk/hc/en-gb/articles/3126957).
-    Title is read from the # heading in the file.
+    Reads the # heading for the title and **Source URL:** for the URL.
+    Falls back to constructing a support.wolterskluwer.co.uk URL from
+    the numeric article ID in the filename if the file cannot be read.
     """
-    fname = Path(file_path).name
-    m = _ARTICLE_ID_RE.match(fname)
-    url = f"{_SUPPORT_BASE}/{m.group(1)}" if m else ""
-
-    title = ""
+    title, url = "", ""
     try:
         with open(file_path, encoding="utf-8") as f:
             header = f.read(1024)
         for line in header.splitlines():
-            if line.startswith("# "):
+            if not title and line.startswith("# "):
                 title = line[2:].strip()
+            if not url and "**Source URL:**" in line:
+                url = line.split("**Source URL:**", 1)[1].strip()
+            if title and url:
                 break
     except OSError:
         pass
+    # Fallback: build URL from article ID prefix in filename
+    if not url:
+        m = _ARTICLE_ID_RE.match(Path(file_path).name)
+        if m:
+            url = f"{_SUPPORT_BASE}/{m.group(1)}"
     return title, url
 
 
