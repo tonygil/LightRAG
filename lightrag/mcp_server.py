@@ -74,16 +74,9 @@ async def query(
         resp = await _client().post("/query", json=payload)
         resp.raise_for_status()
         data = resp.json()
-        answer: str = data.get("response", "")
-        refs: list[dict[str, Any]] = data.get("references") or []
-        if refs:
-            lines = []
-            for r in refs:
-                label = r.get("title") or r.get("reference_id", "?")
-                url = r.get("url") or r.get("file_path", "")
-                lines.append(f"- [{label}]({url})" if url else f"- {label}")
-            return f"{answer}\n\nSources:\n" + "\n".join(lines)
-        return answer
+        # The server already appends a **Sources:** section with clickable URLs
+        # to the response text via _build_sources_section — return it as-is.
+        return data.get("response", "")
     except httpx.HTTPStatusError as e:
         return f"LightRAG error {e.response.status_code}: {e.response.text[:500]}"
     except httpx.RequestError as e:
