@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -44,6 +46,34 @@ def _client() -> httpx.AsyncClient:
             timeout=120.0,
         )
     return _http_client
+
+
+def _build_ref_map(refs: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    """Map article IDs to {url, title} for inline link substitution."""
+    ref_map: dict[str, dict[str, str]] = {}
+    for r in refs:
+        url = r.get("url") or ""
+        title = r.get("title") or ""
+        fp = r.get("file_path") or r.get("reference_id") or ""
+        m = re.match(r"^(\d+)", Path(fp).name)
+        if m and url:
+            ref_map[m.group(1)] = {"url": url, "title": title}
+    return ref_map
+
+
+def _inline_links(text: str, ref_map: dict[str, dict[str, str]]) -> str:
+    """Replace article ID mentions in text with markdown hyperlinks."""
+    if not ref_map:
+        return text
+    ids_pat = "|".join(re.escape(k) for k in sorted(ref_map, key=len, reverse=True))
+    pattern = re.compile(r"(?:Article\s+)?(?<!\d)(" + ids_pat + r")(?!\d)")
+
+    def replace(m: re.Match) -> str:
+        info = ref_map[m.group(1)]
+        label = info["title"] or m.group(1)
+        return f"[{label}]({info['url']})"
+
+    return pattern.sub(replace, text)
 
 
 @mcp.tool()
@@ -75,22 +105,22 @@ async def query(
         resp.raise_for_status()
         data = resp.json()
 
-        # Strip the server-appended Sources section from the answer text
-        # (we rebuild it below in a more prominent format).
         answer: str = data.get("response", "")
         answer = answer.split("\n\n**Sources:**\n")[0].rstrip()
 
-        # Build a clearly separated sources block from the references list
-        # so Claude cannot miss it and must include it verbatim in its reply.
         refs: list[dict[str, Any]] = data.get("references") or []
         if refs:
+            ref_map = _build_ref_map(refs)
+            # Embed links inline so they survive Claude's paraphrasing
+            answer = _inline_links(answer, ref_map)
+
+            # Trailing sources list for refs not mentioned inline
             lines = []
             for r in refs:
                 label = r.get("title") or r.get("reference_id", "?")
                 url = r.get("url") or ""
                 lines.append(f"- [{label}]({url})" if url else f"- {label}")
-            sources_block = "\n\n---\n**SOURCES — include these links verbatim in your reply:**\n" + "\n".join(lines)
-            return answer + sources_block
+            answer += "\n\n**Sources:**\n" + "\n".join(lines)
 
         return answer
     except httpx.HTTPStatusError as e:
