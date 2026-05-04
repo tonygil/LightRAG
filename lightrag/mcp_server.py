@@ -74,9 +74,25 @@ async def query(
         resp = await _client().post("/query", json=payload)
         resp.raise_for_status()
         data = resp.json()
-        # The server already appends a **Sources:** section with clickable URLs
-        # to the response text via _build_sources_section — return it as-is.
-        return data.get("response", "")
+
+        # Strip the server-appended Sources section from the answer text
+        # (we rebuild it below in a more prominent format).
+        answer: str = data.get("response", "")
+        answer = answer.split("\n\n**Sources:**\n")[0].rstrip()
+
+        # Build a clearly separated sources block from the references list
+        # so Claude cannot miss it and must include it verbatim in its reply.
+        refs: list[dict[str, Any]] = data.get("references") or []
+        if refs:
+            lines = []
+            for r in refs:
+                label = r.get("title") or r.get("reference_id", "?")
+                url = r.get("url") or ""
+                lines.append(f"- [{label}]({url})" if url else f"- {label}")
+            sources_block = "\n\n---\n**SOURCES — include these links verbatim in your reply:**\n" + "\n".join(lines)
+            return answer + sources_block
+
+        return answer
     except httpx.HTTPStatusError as e:
         return f"LightRAG error {e.response.status_code}: {e.response.text[:500]}"
     except httpx.RequestError as e:
