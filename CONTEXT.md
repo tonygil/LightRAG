@@ -23,3 +23,14 @@ document insertion or deletion is exposed through this layer.
 The algorithm used to fetch context from the Knowledge Graph (local, global,
 hybrid, naive, mix). Configured server-side via `LIGHTRAG_QUERY_MODE`; not
 exposed as a caller-controlled parameter in the MCP layer.
+
+## QueryParam
+A pure value object that carries all parameters for a single Knowledge Graph
+Query. Has no environment reads at definition time — all numeric defaults are
+compile-time constants from `lightrag/constants.py`.
+
+## ConfigResolver
+The single place where environment variables are read and converted into a
+`QueryParam`. Tests inject a plain `dict`; production code uses `os.environ`
+via the `default_query_param()` convenience function. Lives in
+`lightrag/query_config.py`.
