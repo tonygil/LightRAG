@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from typing import Any
 
@@ -29,6 +30,8 @@ import httpx
 from mcp import McpError
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ErrorData
+
+logger = logging.getLogger(__name__)
 
 API_URL: str = os.environ.get("LIGHTRAG_API_URL", "http://localhost:9621").rstrip("/")
 API_KEY: str = os.environ.get("LIGHTRAG_API_KEY", "")
@@ -159,6 +162,38 @@ async def retrieve(question: str) -> str:
         ) from e
 
 
+async def _warmup() -> None:
+    """Verify the LightRAG server is reachable before accepting MCP connections.
+
+    Surfaces misconfiguration immediately at startup rather than on the first
+    query, so the operator sees a clear error instead of a silent tool failure.
+    A warning (not a crash) is emitted so transient connectivity issues during
+    rolling restarts don't prevent the MCP server from starting.
+    """
+    try:
+        resp = await _client().get("/health", timeout=10.0)
+        if resp.is_success:
+            data = resp.json()
+            status = data.get("status", "unknown")
+            logger.info(
+                "LightRAG server reachable at %s (status: %s)", API_URL, status
+            )
+        else:
+            logger.warning(
+                "LightRAG server at %s returned %s during warm-up — "
+                "queries may fail until the server is healthy.",
+                API_URL,
+                resp.status_code,
+            )
+    except httpx.RequestError as e:
+        logger.warning(
+            "Could not reach LightRAG server at %s during warm-up: %s\n"
+            "Set LIGHTRAG_API_URL to the correct base URL if this persists.",
+            API_URL,
+            e,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="LightRAG MCP server",
@@ -183,6 +218,15 @@ def main() -> None:
         help="Host for SSE transport (default: 0.0.0.0)",
     )
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    import asyncio
+
+    asyncio.run(_warmup())
 
     if args.transport == "sse":
         mcp.run(transport="sse", host=args.host, port=args.port)
