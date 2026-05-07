@@ -1,12 +1,16 @@
 """LightRAG MCP server — wraps the REST API as MCP tools.
 
 Exposes two tools:
-- query: full LLM-synthesised answer from the knowledge graph
-- search: raw entities, relations, and chunks without LLM synthesis
+- query:    Full LLM-synthesised answer from the knowledge graph.
+- retrieve: Raw entities, relations, and chunks without LLM synthesis.
+            Diagnostic/power-user tool for inspecting retrieval quality.
 
 Configure via environment variables:
-  LIGHTRAG_API_URL  Base URL of a running lightrag-server (default: http://localhost:9621)
-  LIGHTRAG_API_KEY  Optional API key for lightrag-server authentication
+  LIGHTRAG_API_URL      Base URL of a running lightrag-server (default: http://localhost:9621)
+  LIGHTRAG_API_KEY      Optional API key for lightrag-server authentication
+  LIGHTRAG_QUERY_MODE   Retrieval mode: local, global, hybrid, naive, or mix (default: mix)
+  LIGHTRAG_TOP_K        Number of top entities/relations to retrieve (default: 60)
+  LIGHTRAG_MCP_TIMEOUT  HTTP timeout in seconds for LightRAG requests (default: 120)
 
 Usage:
   lightrag-mcp                          # stdio transport (Claude Desktop / Cursor)
@@ -22,10 +26,15 @@ import os
 from typing import Any
 
 import httpx
+from mcp import McpError
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ErrorData
 
 API_URL: str = os.environ.get("LIGHTRAG_API_URL", "http://localhost:9621").rstrip("/")
 API_KEY: str = os.environ.get("LIGHTRAG_API_KEY", "")
+QUERY_MODE: str = os.environ.get("LIGHTRAG_QUERY_MODE", "mix")
+TOP_K: int = int(os.environ.get("LIGHTRAG_TOP_K", "60"))
+TIMEOUT: float = float(os.environ.get("LIGHTRAG_MCP_TIMEOUT", "120"))
 
 mcp = FastMCP("LightRAG")
 
@@ -41,17 +50,39 @@ def _client() -> httpx.AsyncClient:
         _http_client = httpx.AsyncClient(
             base_url=API_URL,
             headers=headers,
-            timeout=120.0,
+            timeout=TIMEOUT,
         )
     return _http_client
 
 
+def _format_references(refs: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for r in refs:
+        title: str = r.get("title", "")
+        url: str = r.get("url", "")
+        ref_id: str = str(r.get("reference_id", "?"))
+        if title and url:
+            lines.append(f"- [{title}]({url})")
+        elif url:
+            lines.append(f"- [{ref_id}]({url})")
+        else:
+            lines.append(f"- {title or ref_id}")
+    return "\n".join(lines)
+
+
+def _raise_for_error(resp: httpx.Response) -> None:
+    """Raise McpError on 5xx; let 4xx fall through as a string result."""
+    if resp.status_code >= 500:
+        raise McpError(
+            ErrorData(
+                code=-32603,
+                message=f"LightRAG server error {resp.status_code}: {resp.text[:500]}",
+            )
+        )
+
+
 @mcp.tool()
-async def query(
-    question: str,
-    mode: str = "mix",
-    top_k: int = 60,
-) -> str:
+async def query(question: str) -> str:
     """Query the LightRAG knowledge graph and return an LLM-synthesised answer.
 
     LightRAG understands entities and their relationships, giving richer context
@@ -59,72 +90,73 @@ async def query(
 
     Args:
         question: The question to answer.
-        mode: Retrieval mode — local, global, hybrid, naive, or mix (default).
-              'mix' combines knowledge-graph and vector search and is recommended.
-        top_k: Number of top entities/relations to retrieve (default 60).
     """
     payload: dict[str, Any] = {
         "query": question,
-        "mode": mode,
-        "top_k": top_k,
+        "mode": QUERY_MODE,
+        "top_k": TOP_K,
         "stream": False,
         "include_references": True,
     }
     try:
         resp = await _client().post("/query", json=payload)
-        resp.raise_for_status()
+        _raise_for_error(resp)
+        if not resp.is_success:
+            return f"LightRAG error {resp.status_code}: {resp.text[:500]}"
         data = resp.json()
         answer: str = data.get("response", "")
         refs: list[dict[str, Any]] = data.get("references") or []
         if refs:
-            sources = "\n".join(
-                f"- [{r.get('reference_id', '?')}] {r.get('file_path', '')}"
-                for r in refs
-            )
-            return f"{answer}\n\nSources:\n{sources}"
+            return f"{answer}\n\nSources:\n{_format_references(refs)}"
         return answer
-    except httpx.HTTPStatusError as e:
-        return f"LightRAG error {e.response.status_code}: {e.response.text[:500]}"
+    except McpError:
+        raise
     except httpx.RequestError as e:
-        return (
-            f"Could not reach LightRAG server at {API_URL}. "
-            f"Is lightrag-server running? Details: {e}"
-        )
+        raise McpError(
+            ErrorData(
+                code=-32603,
+                message=(
+                    f"Could not reach LightRAG server at {API_URL}. "
+                    f"Is lightrag-server running? Details: {e}"
+                ),
+            )
+        ) from e
 
 
 @mcp.tool()
-async def search(
-    question: str,
-    mode: str = "mix",
-    top_k: int = 60,
-) -> str:
+async def retrieve(question: str) -> str:
     """Search the LightRAG knowledge graph and return raw entities, relations, and chunks.
 
     Returns the retrieved context directly with no LLM synthesis, giving full
     visibility into the graph relationships and source text LightRAG found.
-    Useful when you want to reason over the raw evidence yourself.
+    Intended for developers and power users inspecting retrieval quality.
 
     Args:
         question: The search query.
-        mode: Retrieval mode — local, global, hybrid, naive, or mix (default).
-        top_k: Number of top entities/relations to retrieve (default 60).
     """
     payload: dict[str, Any] = {
         "query": question,
-        "mode": mode,
-        "top_k": top_k,
+        "mode": QUERY_MODE,
+        "top_k": TOP_K,
     }
     try:
         resp = await _client().post("/query/data", json=payload)
-        resp.raise_for_status()
+        _raise_for_error(resp)
+        if not resp.is_success:
+            return f"LightRAG error {resp.status_code}: {resp.text[:500]}"
         return json.dumps(resp.json(), indent=2, ensure_ascii=False)
-    except httpx.HTTPStatusError as e:
-        return f"LightRAG error {e.response.status_code}: {e.response.text[:500]}"
+    except McpError:
+        raise
     except httpx.RequestError as e:
-        return (
-            f"Could not reach LightRAG server at {API_URL}. "
-            f"Is lightrag-server running? Details: {e}"
-        )
+        raise McpError(
+            ErrorData(
+                code=-32603,
+                message=(
+                    f"Could not reach LightRAG server at {API_URL}. "
+                    f"Is lightrag-server running? Details: {e}"
+                ),
+            )
+        ) from e
 
 
 def main() -> None:
